@@ -73,7 +73,7 @@ def visualize_pipeline(img: np.ndarray,
     H, W = act.shape
 
     # карта-накопитель детекторов для этого стимула
-    ov = detector_overlay_matrix(code, det, only_fired=True, weight="uniform", normalize=True)
+    ov = detector_overlay_matrix(code, det, only_fired=True, weight=overlay_weight, normalize=True)
 
     # 3) эмбеддинг и сработавшие детекторы
     ones = det.embed(code)  # множество активных битов
@@ -177,7 +177,7 @@ def visualize_pipeline(img: np.ndarray,
 def detector_overlay_matrix(code: Set[int],
                             det: "DetectorSpace",
                             only_fired: bool = True,
-                            weight: str = "uniform",   # "uniform" | "activation"
+                            weight: str = "activation",   # "uniform" | "activation"
                             normalize: bool = True) -> np.ndarray:
     """
     Строит H×W карту-накопитель поверх раскладки:
@@ -276,7 +276,7 @@ def class_overlay_matrix(label: int,
                          enc: "PrimaryEncoder",
                          det: "DetectorSpace",
                          limit: int = 100,
-                         weight: str = "uniform",   # "uniform" | "activation"
+                         weight: str = "activation",   # "uniform" | "activation"
                          normalize: bool = True) -> np.ndarray:
     """
     Накопительная карта по многим примерам ОДНОГО класса (например, '9').
@@ -316,7 +316,7 @@ def save_class_overlay_pdf(label: int,
                            enc: "PrimaryEncoder",
                            det: "DetectorSpace",
                            limit: int = 100,
-                           weight: str = "uniform",   # "uniform" | "activation"
+                           weight: str = "activation",   # "uniform" | "activation"
                            normalize: bool = True,
                            pdf_path: str = None,
                            cmap: str = "inferno") -> str:

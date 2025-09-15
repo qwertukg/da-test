@@ -8,12 +8,12 @@ from damp_light import (
     PrimaryEncoder, Layout2D, DetectorSpace, KNNJaccard,
     load_mnist_28x28, to01
 )
-from viz import save_embedding_core_heatmap
+from viz import save_embedding_core_heatmap, show_semantic_closeness
 
 
 def main(digit: int = 0) -> None:
     """Запускает полный цикл обучения и оценки для одной цифры."""
-    dset = "sklearn"
+    dset = "mnist"
     count = 100
     if dset == "mnist":
         X_train, X_test, y_train, y_test = load_mnist_28x28(
@@ -93,7 +93,14 @@ def main(digit: int = 0) -> None:
     except Exception as e:
         print(f"[WARN] Heatmap ядра не построен: {e}")
 
+    # dset — строка с названием датасета; если её нет, поставь вручную, например "skdigits" или "mnist"
+    try:
+        dset_safe = dset if "dset" in locals() else "dataset"
+        show_semantic_closeness(Z_train, y_train, det, dset_name=dset_safe, tau=0.25, max_pairs=5000)
+    except Exception as e:
+        print(f"[WARN] Не удалось построить демонстрации близости: {e}")
+
 
 if __name__ == "__main__":
-    for i in range(10):
-        main(i)
+    # for i in range(10):
+    main(1)

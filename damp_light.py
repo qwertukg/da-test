@@ -16,29 +16,9 @@ from collections import deque, Counter
 from typing import List, Tuple, Dict, Set, Optional
 
 import numpy as np
-from sklearn.datasets import load_digits
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from torchvision import transforms
 from torchvision.datasets import MNIST
-from sklearn.manifold import MDS
-import json, datetime as dt
-from pathlib import Path
-from scipy.signal import convolve2d
 from collections import Counter
-
-def print_top_common_bits(Z, y, top=10):
-    by_cls = {}
-    for z, c in zip(Z, y):
-        by_cls.setdefault(int(c), []).append(z)
-    for c, zs in sorted(by_cls.items()):
-        n = len(zs)
-        df = Counter(b for z in zs for b in z)  # частота детектора по классу
-        top_bits = sorted(df.items(), key=lambda t: t[1], reverse=True)[:top]
-        print(f"\nКласс {c}: n={n}")
-        for b, f in top_bits:
-            print(f"  бит {b}: доля {f/n:.2f}")
 
 
 # ============================================================

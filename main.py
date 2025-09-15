@@ -17,7 +17,7 @@ from viz import save_embedding_core_heatmap, show_semantic_closeness, visualize_
 
 def main(digit: int = 0) -> None:
     """Запускает полный цикл обучения и оценки для одной цифры."""
-    dset = "mnist"
+    dset = "sklearn"
     count = 100
     if dset == "mnist":
         X_train, X_test, y_train, y_test = load_mnist_28x28(

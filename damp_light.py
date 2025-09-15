@@ -12,54 +12,13 @@ discrete_digits_final.py — дискретное кодирование 0–9 �
 """
 
 import math, random
-from collections import deque, Counter
+from collections import deque
 from typing import List, Tuple, Dict, Set, Optional
 
 import numpy as np
-from torchvision import transforms
-from torchvision.datasets import MNIST
-from collections import Counter
 
+from dl_utils import cosbin
 
-# ============================================================
-# Утилиты для битовых кодов (коды = set[int] активных позиций)
-# ============================================================
-
-def jaccard(a: Set[int], b: Set[int]) -> float:
-    if not a and not b: return 1.0
-    if not a or not b:  return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
-
-def cosbin(a: Set[int], b: Set[int]) -> float:
-    if not a or not b: return 0.0
-    inter = len(a & b)
-    return inter / math.sqrt(len(a) * len(b))
-
-# ============================================================
-# Свёртка и ориентиры Собеля
-# ============================================================
-
-def _conv2_same(img: np.ndarray, k: np.ndarray) -> np.ndarray:
-    ph, pw = k.shape[0] // 2, k.shape[1] // 2
-    pad = np.pad(img, ((ph, ph), (pw, pw)), mode='edge')
-    H, W = img.shape
-    out = np.zeros_like(img, dtype=np.float32)
-    for y in range(H):
-        for x in range(W):
-            patch = pad[y:y + k.shape[0], x:x + k.shape[1]]
-            out[y, x] = float(np.sum(patch * k))
-    return out
-
-def sobel_mag_dir(img01: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
-    ky = np.array([[ 1, 2, 1], [ 0, 0, 0], [-1,-2,-1]], dtype=np.float32)
-    gx = _conv2_same(img01, kx)
-    gy = _conv2_same(img01, ky)
-    mag = np.hypot(gx, gy)
-    ang = (np.arctan2(gy, gx) + np.pi)  # [0, 2π)
-    return mag, ang
 
 # ============================================================
 # 1) Первичное кодирование (каналы + "цветовое" объединение)
@@ -167,7 +126,7 @@ class PrimaryEncoder:
 
         # --- ORIENT (priority 1.5) ---
         if self.orient_on:
-            mag, ang = sobel_mag_dir(img)
+            mag, ang = self._sobel_mag_dir(img)
             gy, gx = self.H // self.orient_grid, self.W // self.orient_grid
             mmax = float(np.max(mag))
             mnorm = mag / (mmax + 1e-8) if mmax > 1e-8 else mag
@@ -210,6 +169,29 @@ class PrimaryEncoder:
             if len(out) >= self.max_active: break
             out.add(bit)
         return out
+
+    # --- служебные методы ---
+    @staticmethod
+    def _conv2_same(img: np.ndarray, k: np.ndarray) -> np.ndarray:
+        ph, pw = k.shape[0] // 2, k.shape[1] // 2
+        pad = np.pad(img, ((ph, ph), (pw, pw)), mode='edge')
+        H, W = img.shape
+        out = np.zeros_like(img, dtype=np.float32)
+        for y in range(H):
+            for x in range(W):
+                patch = pad[y:y + k.shape[0], x:x + k.shape[1]]
+                out[y, x] = float(np.sum(patch * k))
+        return out
+
+    @classmethod
+    def _sobel_mag_dir(cls, img01: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        ky = np.array([[ 1, 2, 1], [ 0, 0, 0], [-1,-2,-1]], dtype=np.float32)
+        gx = cls._conv2_same(img01, kx)
+        gy = cls._conv2_same(img01, ky)
+        mag = np.hypot(gx, gy)
+        ang = (np.arctan2(gy, gx) + np.pi)
+        return mag, ang
 
 # ============================================================
 # 2) Раскладка (упрощённый DAMP с локальными свапами и override)
@@ -341,56 +323,6 @@ class Layout2D:
         return self.idx2cell[idx]
 
 # ============================================================
-# 3) Служебные функции для детекторов
-# ============================================================
-
-def connected_components(mask: np.ndarray) -> List[List[Tuple[int, int]]]:
-    H, W = mask.shape
-    seen = np.zeros_like(mask, dtype=bool)
-    comps = []
-    for y in range(H):
-        for x in range(W):
-            if not mask[y, x] or seen[y, x]: continue
-            q = deque([(y, x)]); seen[y, x] = True
-            comp = [(y, x)]
-            while q:
-                cy, cx = q.popleft()
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        if dy == 0 and dx == 0: continue
-                        ny, nx = cy + dy, cx + dx
-                        if 0 <= ny < H and 0 <= nx < W and mask[ny, nx] and not seen[ny, nx]:
-                            seen[ny, nx] = True
-                            q.append((ny, nx))
-                            comp.append((ny, nx))
-            comps.append(comp)
-    return comps
-
-def comp_center_radius(comp: List[Tuple[int, int]]) -> Tuple[Tuple[float, float], float]:
-    ys = [p[0] for p in comp]; xs = [p[1] for p in comp]
-    cy, cx = float(np.mean(ys)), float(np.mean(xs))
-    r = 0.0
-    for (y, x) in comp:
-        r = max(r, math.hypot(y - cy, x - cx))
-    return (cy, cx), (r * 1.15 + 0.5)
-
-def pca_ellipse(points: List[Tuple[int, int]], pad_scale: float = 1.6):
-    ys = np.array([p[0] for p in points], dtype=np.float32)
-    xs = np.array([p[1] for p in points], dtype=np.float32)
-    cy, cx = float(ys.mean()), float(xs.mean())
-    Y = np.stack([ys - cy, xs - cx], axis=0)  # 2×N
-    if Y.shape[1] < 3:
-        # слишком мало точек — вернём маленький круг
-        return (cy, cx), (np.array([1.0, 0.0]), np.array([0.0, 1.0])), (1.0, 1.0)
-    C = (Y @ Y.T) / max(1, Y.shape[1] - 1)    # ковариация 2×2
-    vals, vecs = np.linalg.eigh(C)            # по возрастанию
-    vals = np.clip(vals, 1e-6, None)
-    r1, r2 = pad_scale * float(np.sqrt(vals[1])), pad_scale * float(np.sqrt(vals[0]))
-    u1 = vecs[:, 1] / np.linalg.norm(vecs[:, 1])
-    u2 = vecs[:, 0] / np.linalg.norm(vecs[:, 0])
-    return (cy, cx), (u1, u2), (r1, r2)
-
-# ============================================================
 # 4) Детекторы: адаптивный порог + эллипсы
 # ============================================================
 
@@ -490,11 +422,11 @@ class DetectorSpace:
         for idx in seed_idxs:
             code = self.codes_train[idx]
             act = self._activation_map_adaptive(code)
-            comps = connected_components(act)
+            comps = self._connected_components(act)
             for comp in comps:
                 if len(comp) < self.min_comp: continue
-                center_c, radius_c = comp_center_radius(comp)
-                (cent_e, (u1, u2), (r1, r2)) = pca_ellipse(comp, pad_scale=1.6)
+                center_c, radius_c = self._comp_center_radius(comp)
+                (cent_e, (u1, u2), (r1, r2)) = self._pca_ellipse(comp, pad_scale=1.6)
                 elong = (max(r1, r2) / max(1e-6, min(r1, r2)))
                 if elong >= 1.4 and max(r1, r2) > 0.8:
                     candidates.append({
@@ -559,6 +491,60 @@ class DetectorSpace:
                     ones.add(d["bit"])
         return ones
 
+    # --- служебные методы ---
+    @staticmethod
+    def _connected_components(mask: np.ndarray) -> List[List[Tuple[int, int]]]:
+        H, W = mask.shape
+        seen = np.zeros_like(mask, dtype=bool)
+        comps = []
+        for y in range(H):
+            for x in range(W):
+                if not mask[y, x] or seen[y, x]:
+                    continue
+                q = deque([(y, x)])
+                seen[y, x] = True
+                comp = [(y, x)]
+                while q:
+                    cy, cx = q.popleft()
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            if dy == 0 and dx == 0:
+                                continue
+                            ny, nx = cy + dy, cx + dx
+                            if 0 <= ny < H and 0 <= nx < W and mask[ny, nx] and not seen[ny, nx]:
+                                seen[ny, nx] = True
+                                q.append((ny, nx))
+                                comp.append((ny, nx))
+                comps.append(comp)
+        return comps
+
+    @staticmethod
+    def _comp_center_radius(comp: List[Tuple[int, int]]) -> Tuple[Tuple[float, float], float]:
+        ys = [p[0] for p in comp]
+        xs = [p[1] for p in comp]
+        cy, cx = float(np.mean(ys)), float(np.mean(xs))
+        r = 0.0
+        for (y, x) in comp:
+            r = max(r, math.hypot(y - cy, x - cx))
+        return (cy, cx), (r * 1.15 + 0.5)
+
+    @staticmethod
+    def _pca_ellipse(points: List[Tuple[int, int]], pad_scale: float = 1.6):
+        ys = np.array([p[0] for p in points], dtype=np.float32)
+        xs = np.array([p[1] for p in points], dtype=np.float32)
+        cy, cx = float(ys.mean()), float(xs.mean())
+        Y = np.stack([ys - cy, xs - cx], axis=0)
+        if Y.shape[1] < 3:
+            return (cy, cx), (np.array([1.0, 0.0]), np.array([0.0, 1.0])), (1.0, 1.0)
+        C = (Y @ Y.T) / max(1, Y.shape[1] - 1)
+        vals, vecs = np.linalg.eigh(C)
+        vals = np.clip(vals, 1e-6, None)
+        r1 = pad_scale * float(np.sqrt(vals[1]))
+        r2 = pad_scale * float(np.sqrt(vals[0]))
+        u1 = vecs[:, 1] / np.linalg.norm(vecs[:, 1])
+        u2 = vecs[:, 0] / np.linalg.norm(vecs[:, 0])
+        return (cy, cx), (u1, u2), (r1, r2)
+
 # ============================================================
 # 5) Взвешенный kNN по Жаккару
 # ============================================================
@@ -575,7 +561,7 @@ class KNNJaccard:
     def predict(self, X: List[Set[int]]) -> List[int]:
         out = []
         for q in X:
-            sims = [(jaccard(q, x), yi) for x, yi in zip(self.X, self.y)]
+            sims = [(self.jaccard(q, x), yi) for x, yi in zip(self.X, self.y)]
             sims.sort(key=lambda z: -z[0])
             top = sims[:self.k]
             score: Dict[int, float] = {}
@@ -584,37 +570,14 @@ class KNNJaccard:
             out.append(max(score.items(), key=lambda z: z[1])[0])
         return out
 
-# ============================================================
-# 6) Всё вместе
-# ============================================================
-
-def to01(img8x8: np.ndarray) -> np.ndarray:
-    # load_digits даёт 0..16 -> в 0..1
-    return (img8x8.astype(np.float32) / 16.0).reshape(8, 8)
-
-
-def load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0):
-    """
-    Грузим MNIST (28×28, 0..1), слегка подсэмплируем для разумного времени работы.
-    Вернёт списки 2D numpy-массивов (H×W) и метки.
-    """
-    tfm = transforms.ToTensor()  # -> tensor [1,28,28] в [0,1]
-    train_ds = MNIST(root="./data", train=True, download=True, transform=tfm)
-    test_ds  = MNIST(root="./data", train=False, download=True, transform=tfm)
-
-    rng = np.random.default_rng(seed)
-    train_idx = np.arange(len(train_ds))
-    test_idx  = np.arange(len(test_ds))
-
-    if train_limit and len(train_idx) > train_limit:
-        train_idx = rng.choice(train_idx, size=train_limit, replace=False)
-    if test_limit and len(test_idx) > test_limit:
-        test_idx = rng.choice(test_idx, size=test_limit, replace=False)
-
-    X_train = [train_ds[i][0].squeeze(0).numpy().astype(np.float32) for i in train_idx]
-    y_train = [int(train_ds[i][1]) for i in train_idx]
-    X_test  = [test_ds[i][0].squeeze(0).numpy().astype(np.float32) for i in test_idx]
-    y_test  = [int(test_ds[i][1]) for i in test_idx]
-    return X_train, X_test, y_train, y_test
+    @staticmethod
+    def jaccard(a: Set[int], b: Set[int]) -> float:
+        if not a and not b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        inter = len(a & b)
+        union = len(a | b)
+        return inter / union if union else 0.0
 
 

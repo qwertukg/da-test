@@ -480,7 +480,7 @@ def show_semantic_closeness(Z: List[Set[int]], y: List[int], det: DetectorSpace,
     Mt = np.zeros((C, C), dtype=np.float32)  # Tanimoto по частотам
     for i in range(C):
         for j in range(C):
-            Mj[i, j] = jaccard(S[i], S[j])
+            Mj[i, j] = KNNJaccard.jaccard(S[i], S[j])
             Mt[i, j] = _tanimoto(F[i], F[j])
 
     # --- Heatmap: Жаккар по наборам ---
@@ -534,8 +534,8 @@ def show_semantic_closeness(Z: List[Set[int]], y: List[int], det: DetectorSpace,
         if y[i] != y[j]:
             diff_pairs.append((i, j))
 
-    js_same = np.array([jaccard(Z[i], Z[j]) for (i, j) in same_pairs], dtype=np.float32) if same_pairs else np.array([0.0])
-    js_diff = np.array([jaccard(Z[i], Z[j]) for (i, j) in diff_pairs], dtype=np.float32) if diff_pairs else np.array([0.0])
+    js_same = np.array([KNNJaccard.jaccard(Z[i], Z[j]) for (i, j) in same_pairs], dtype=np.float32) if same_pairs else np.array([0.0])
+    js_diff = np.array([KNNJaccard.jaccard(Z[i], Z[j]) for (i, j) in diff_pairs], dtype=np.float32) if diff_pairs else np.array([0.0])
 
     plt.figure(figsize=(6.8, 4.2))
     bins = np.linspace(0, 1, 41)

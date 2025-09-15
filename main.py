@@ -7,10 +7,8 @@ from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from damp_light import (
-    KNNJaccard,
-    load_mnist_28x28, to01
-)
+from damp_light import KNNJaccard
+from dl_utils import load_mnist_28x28, to01
 from training_cache import load_or_train
 from viz import save_embedding_core_heatmap, show_semantic_closeness, visualize_pipeline, save_class_overlay_pdf
 

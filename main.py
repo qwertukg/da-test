@@ -35,7 +35,7 @@ def main(digit: int = 0) -> None:
         X_train, X_test, y_train, img_hw, dset=dset
     )
 
-    clf = KNNJaccard(k=5).fit(Z_train, y_train)
+    clf = KNNJaccard(k=3).fit(Z_train, y_train)
     y_pred = clf.predict(Z_test)
     acc = accuracy_score(y_test, y_pred)
 

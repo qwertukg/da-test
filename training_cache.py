@@ -18,7 +18,7 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
             coarse_bits_per_cell=4,
             bright_levels=8,
             orient_on=True, orient_bins=8, orient_grid=4,
-            orient_bits_per_cell=2, orient_mag_thresh=0.12,
+            orient_bits_per_cell=2, orient_mag_thresh=0.10,
             max_active_bits=260
         )
         codes_train = [enc.encode(img) for img in X_train]
@@ -31,11 +31,11 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
             lam_floor=0.06,
             percentile=0.88,
             min_activated=35,
-            mu=0.20,
+            mu=0.15,
             seeds=1200,
-            min_comp=5,
+            min_comp=4,
             min_center_dist=1.6,
-            max_detectors=256,
+            max_detectors=260,
             seed=7
         )
         Z_train = [det.embed(c) for c in codes_train]

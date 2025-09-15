@@ -342,3 +342,93 @@ def save_class_overlay_pdf(label: int,
         plt.close(fig)
 
     return pdf_path
+
+
+def embedding_core_heatmap(label: int, Z: List[Set[int]], y: List[int], det: DetectorSpace,
+                           normalize: bool = True, area_equalize: bool = False) -> np.ndarray:
+    """
+    Возвращает H×W карту: сумма по детекторам [частота_бита_в_классе] на их фигурах.
+    """
+    H, W = det.H, det.W
+    idxs = [i for i, yy in enumerate(y) if int(yy) == int(label)]
+    if not idxs:
+        return np.zeros((H, W), dtype=np.float32)
+    from collections import Counter
+    cnt = Counter()
+    for i in idxs:
+        for b in Z[i]:
+            cnt[b] += 1
+    freq = {b: cnt[b] / float(len(idxs)) for b in cnt}
+
+    heat = np.zeros((H, W), dtype=np.float32)
+
+    for d in det.detectors:
+        b = d.get("bit")
+        p = freq.get(b, 0.0)
+        if p <= 0.0:
+            continue
+        cy, cx = d["center"]
+
+        if d.get("shape") == "ellipse":
+            u1, u2 = d["u1"], d["u2"]; r1, r2 = float(d["r1"]), float(d["r2"])
+            y0, y1 = max(0, int(cy - r1 - r2)), min(H - 1, int(cy + r1 + r2) + 1)
+            x0, x1 = max(0, int(cx - r1 - r2)), min(W - 1, int(cx + r1 + r2) + 1)
+            if y1 < y0 or x1 < x0:
+                continue
+            area = 0
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    vy, vx = (yv - cy), (xv - cx)
+                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
+                    b2 = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
+                    if (a * a + b2 * b2) <= 1.0:
+                        area += 1
+            if area == 0:
+                continue
+            add = (p / area) if area_equalize else p
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    vy, vx = (yv - cy), (xv - cx)
+                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
+                    b2 = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
+                    if (a * a + b2 * b2) <= 1.0:
+                        heat[yv, xv] += add
+        else:
+            r = float(d["radius"])
+            y0, y1 = max(0, int(cy - r)), min(H - 1, int(cy + r) + 1)
+            x0, x1 = max(0, int(cx - r)), min(W - 1, int(cx + r) + 1)
+            if y1 < y0 or x1 < x0:
+                continue
+            area = 0
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    if (yv - cy) ** 2 + (xv - cx) ** 2 <= r ** 2 + 1e-9:
+                        area += 1
+            if area == 0:
+                continue
+            add = (p / area) if area_equalize else p
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    if (yv - cy) ** 2 + (xv - cx) ** 2 <= r ** 2 + 1e-9:
+                        heat[yv, xv] += add
+
+    if normalize and heat.max() > 0:
+        heat = heat / float(heat.max())
+    return heat
+
+
+def save_embedding_core_heatmap(label: int, Z: List[Set[int]], y: List[int], det: DetectorSpace,
+                                out_path: str, normalize: bool = True,
+                                area_equalize: bool = False) -> str:
+    """
+    Строит и сохраняет heatmap ядра эмбеддингов класса.
+    Возвращает путь к сохранённому PNG.
+    """
+    core = embedding_core_heatmap(label, Z, y, det, normalize, area_equalize)
+    plt.figure(figsize=(5, 5))
+    plt.imshow(core, origin="lower")
+    plt.title(f"Ядро эмбеддингов класса {label} (частоты детекторов)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    return out_path

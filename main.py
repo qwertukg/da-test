@@ -1,14 +1,18 @@
 import numpy as np
 from typing import List, Set
+
+from matplotlib import pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 from damp_light import (
-    PrimaryEncoder, Layout2D, DetectorSpace, KNNJaccard,
+    KNNJaccard,
     load_mnist_28x28, to01
 )
-from viz import save_embedding_core_heatmap, show_semantic_closeness
+from training_cache import load_or_train
+from viz import save_embedding_core_heatmap, show_semantic_closeness, visualize_pipeline, save_class_overlay_pdf
 
 
 def main(digit: int = 0) -> None:
@@ -29,38 +33,9 @@ def main(digit: int = 0) -> None:
         )
         img_hw = (8, 8)
 
-    enc = PrimaryEncoder(
-        img_hw=img_hw, bits=8192,
-        grid_g=4, grid_levels=4, grid_bits_per_cell=3,
-        coarse_bits_per_cell=4,
-        bright_levels=8,
-        orient_on=True, orient_bins=8, orient_grid=4,
-        orient_bits_per_cell=2, orient_mag_thresh=0.12,
-        max_active_bits=260
+    enc, lay, det, Z_train, Z_test = load_or_train(
+        X_train, X_test, y_train, img_hw, dset=dset
     )
-
-    codes_train = [enc.encode(img) for img in X_train]
-    codes_test  = [enc.encode(img) for img in X_test]
-
-    lay = Layout2D(R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123)
-    lay.fit(codes_train)
-
-    det = DetectorSpace(
-        lay, codes_train, y_train,
-        emb_bits=256,
-        lam_floor=0.06,
-        percentile=0.88,
-        min_activated=35,
-        mu=0.20,
-        seeds=1200,
-        min_comp=5,
-        min_center_dist=1.6,
-        max_detectors=512,
-        seed=7
-    )
-
-    Z_train = [det.embed(c) for c in codes_train]
-    Z_test  = [det.embed(c) for c in codes_test]
 
     clf = KNNJaccard(k=5).fit(Z_train, y_train)
     y_pred = clf.predict(Z_test)
@@ -100,6 +75,40 @@ def main(digit: int = 0) -> None:
     except Exception as e:
         print(f"[WARN] Не удалось построить демонстрации близости: {e}")
 
+    # --- пакетная визуализация 100 вариантов цифры "9" в один PDF ---
+    nine_idxs = [i for i, lbl in enumerate(y_test) if int(lbl) == digit]
+    if not nine_idxs:
+        print(f"В тестовой выборке нет цифр '{digit}' — визуализировать нечего.")
+    else:
+        rng = np.random.default_rng(0)  # фикс для воспроизводимости
+        sel = nine_idxs if len(nine_idxs) <= count else list(rng.choice(nine_idxs, size=count, replace=False))
+        pdf_path = f"{dset}_pipeline_{digit}x{count}.pdf"
+        with PdfPages(pdf_path) as pdf:
+            for i in sel:
+                fig = visualize_pipeline(
+                    img=X_test[i],
+                    enc=enc,
+                    lay=lay,
+                    det=det,
+                    clf=clf,
+                    true_label=y_test[i],
+                    title=f"От стимула к смыслу — цифра {digit} (test idx {i})",
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
+        print(f"Сохранено в PDF: {pdf_path} (страниц: {len(sel)})")
+
+        # Пример: сохраняем суммарную карту для цифры 'digit' по count примерам
+        pdf_path = save_class_overlay_pdf(
+            label=digit,
+            X=X_test, y=y_test,
+            enc=enc, det=det,
+            limit=count,
+            weight="activation",  # или "uniform"
+            normalize=True,
+            pdf_path=f"{dset}_overlay_class{digit}_{count}_activation.pdf"
+        )
+        print(f"PDF сохранён: {pdf_path}")
 
 if __name__ == "__main__":
     # for i in range(10):

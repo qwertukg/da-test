@@ -342,3 +342,216 @@ def save_class_overlay_pdf(label: int,
         plt.close(fig)
 
     return pdf_path
+
+
+def embedding_core_heatmap(label: int, Z: List[Set[int]], y: List[int], det: DetectorSpace,
+                           normalize: bool = True, area_equalize: bool = False) -> np.ndarray:
+    """
+    Возвращает H×W карту: сумма по детекторам [частота_бита_в_классе] на их фигурах.
+    """
+    H, W = det.H, det.W
+    idxs = [i for i, yy in enumerate(y) if int(yy) == int(label)]
+    if not idxs:
+        return np.zeros((H, W), dtype=np.float32)
+    from collections import Counter
+    cnt = Counter()
+    for i in idxs:
+        for b in Z[i]:
+            cnt[b] += 1
+    freq = {b: cnt[b] / float(len(idxs)) for b in cnt}
+
+    heat = np.zeros((H, W), dtype=np.float32)
+
+    for d in det.detectors:
+        b = d.get("bit")
+        p = freq.get(b, 0.0)
+        if p <= 0.0:
+            continue
+        cy, cx = d["center"]
+
+        if d.get("shape") == "ellipse":
+            u1, u2 = d["u1"], d["u2"]; r1, r2 = float(d["r1"]), float(d["r2"])
+            y0, y1 = max(0, int(cy - r1 - r2)), min(H - 1, int(cy + r1 + r2) + 1)
+            x0, x1 = max(0, int(cx - r1 - r2)), min(W - 1, int(cx + r1 + r2) + 1)
+            if y1 < y0 or x1 < x0:
+                continue
+            area = 0
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    vy, vx = (yv - cy), (xv - cx)
+                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
+                    b2 = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
+                    if (a * a + b2 * b2) <= 1.0:
+                        area += 1
+            if area == 0:
+                continue
+            add = (p / area) if area_equalize else p
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    vy, vx = (yv - cy), (xv - cx)
+                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
+                    b2 = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
+                    if (a * a + b2 * b2) <= 1.0:
+                        heat[yv, xv] += add
+        else:
+            r = float(d["radius"])
+            y0, y1 = max(0, int(cy - r)), min(H - 1, int(cy + r) + 1)
+            x0, x1 = max(0, int(cx - r)), min(W - 1, int(cx + r) + 1)
+            if y1 < y0 or x1 < x0:
+                continue
+            area = 0
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    if (yv - cy) ** 2 + (xv - cx) ** 2 <= r ** 2 + 1e-9:
+                        area += 1
+            if area == 0:
+                continue
+            add = (p / area) if area_equalize else p
+            for yv in range(y0, y1 + 1):
+                for xv in range(x0, x1 + 1):
+                    if (yv - cy) ** 2 + (xv - cx) ** 2 <= r ** 2 + 1e-9:
+                        heat[yv, xv] += add
+
+    if normalize and heat.max() > 0:
+        heat = heat / float(heat.max())
+    return heat
+
+
+def save_embedding_core_heatmap(label: int, Z: List[Set[int]], y: List[int], det: DetectorSpace,
+                                out_path: str, normalize: bool = True,
+                                area_equalize: bool = False) -> str:
+    """
+    Строит и сохраняет heatmap ядра эмбеддингов класса.
+    Возвращает путь к сохранённому PNG.
+    """
+    core = embedding_core_heatmap(label, Z, y, det, normalize, area_equalize)
+    plt.figure(figsize=(5, 5))
+    plt.imshow(core, origin="lower")
+    plt.title(f"Ядро эмбеддингов класса {label} (частоты детекторов)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    return out_path
+
+# ======= Показ близости "смыслов" через биты эмбеддингов =======
+def _tanimoto(v: np.ndarray, w: np.ndarray) -> float:
+    dot = float(np.dot(v, w))
+    denom = float(np.dot(v, v) + np.dot(w, w) - dot)
+    return (dot / denom) if denom > 1e-12 else 0.0
+
+def show_semantic_closeness(Z: List[Set[int]], y: List[int], det: DetectorSpace,
+                            dset_name: str = "dataset", tau: float = 0.25,
+                            max_pairs: int = 5000, seed: int = 0):
+    """
+    Строит:
+      - class_sim_jaccard (по порогу tau на частотах битов)
+      - class_sim_tanimoto (по непрерывным частотам)
+      - MDS (по расстояниям 1 - tanimoto)
+      - распределения Жаккара: внутри класса vs между классами
+    Сохраняет четыре PNG и печатает сводку/топ-соседей классов.
+    """
+    import numpy as np, matplotlib.pyplot as plt, random
+    from sklearn.manifold import MDS
+
+    labels = sorted({int(c) for c in y})
+    C = len(labels)
+    emb_bits = det.emb_bits
+
+    # Индексы примеров по классам
+    idxs_by_cls = {c: [i for i, yy in enumerate(y) if int(yy) == c] for c in labels}
+
+    # Частоты битов в классах (C x E)
+    F = np.zeros((C, emb_bits), dtype=np.float32)
+    for ci, c in enumerate(labels):
+        idxs = idxs_by_cls[c]
+        if not idxs: continue
+        cnt = np.zeros(emb_bits, dtype=np.float32)
+        for i in idxs:
+            for b in Z[i]:
+                if 0 <= b < emb_bits:
+                    cnt[b] += 1
+        F[ci] = cnt / max(1.0, float(len(idxs)))
+
+    # Порогование частот -> "класс-прототипы" как множества битов
+    S = [set(np.nonzero(F[ci] >= tau)[0].tolist()) for ci in range(C)]
+
+    # Матрицы похожести между классами
+    Mj = np.zeros((C, C), dtype=np.float32)  # Жаккар по порогованным наборам
+    Mt = np.zeros((C, C), dtype=np.float32)  # Tanimoto по частотам
+    for i in range(C):
+        for j in range(C):
+            Mj[i, j] = jaccard(S[i], S[j])
+            Mt[i, j] = _tanimoto(F[i], F[j])
+
+    # --- Heatmap: Жаккар по наборам ---
+    def _plot_heatmap(M, title, path):
+        plt.figure(figsize=(6.2, 5.2))
+        plt.imshow(M, origin="lower", vmin=0, vmax=1)
+        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.xticks(range(C), labels)
+        plt.yticks(range(C), labels)
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(path, dpi=160); plt.close()
+
+    _plot_heatmap(Mj, f"{dset_name}: class similarity (Jaccard, tau={tau:.2f})",
+                  f"{dset_name}_class_sim_jaccard_tau{tau:.2f}.png")
+
+    # --- Heatmap: Tanimoto по частотам ---
+    _plot_heatmap(Mt, f"{dset_name}: class similarity (Tanimoto)",
+                  f"{dset_name}_class_sim_tanimoto.png")
+
+    # --- MDS проекция классов по 1 - Tanimoto ---
+    D = 1.0 - Mt
+    try:
+        xy = MDS(n_components=2, dissimilarity='precomputed', random_state=0).fit_transform(D)
+        plt.figure(figsize=(6.2, 5.2))
+        plt.scatter(xy[:, 0], xy[:, 1])
+        for i, c in enumerate(labels):
+            plt.text(xy[i, 0], xy[i, 1], str(c), fontsize=12, ha='center', va='center')
+        plt.title(f"{dset_name}: MDS of classes (1 - Tanimoto)")
+        plt.tight_layout()
+        plt.savefig(f"{dset_name}_mds_classes.png", dpi=160); plt.close()
+    except Exception as e:
+        print(f"[WARN] MDS не построен: {e}")
+
+    # --- Распределения Жаккара: внутри класса vs между классами ---
+    rng = random.Random(seed)
+    all_idx = list(range(len(y)))
+
+    same_pairs = []
+    per_cls = max(1, max_pairs // max(1, C))
+    for c in labels:
+        L = idxs_by_cls[c]
+        if len(L) >= 2:
+            for _ in range(per_cls):
+                i, j = rng.sample(L, 2)
+                same_pairs.append((i, j))
+
+    diff_pairs = []
+    while len(diff_pairs) < max_pairs and len(diff_pairs) < len(all_idx) * 3:
+        i, j = rng.sample(all_idx, 2)
+        if y[i] != y[j]:
+            diff_pairs.append((i, j))
+
+    js_same = np.array([jaccard(Z[i], Z[j]) for (i, j) in same_pairs], dtype=np.float32) if same_pairs else np.array([0.0])
+    js_diff = np.array([jaccard(Z[i], Z[j]) for (i, j) in diff_pairs], dtype=np.float32) if diff_pairs else np.array([0.0])
+
+    plt.figure(figsize=(6.8, 4.2))
+    bins = np.linspace(0, 1, 41)
+    plt.hist(js_diff, bins=bins, alpha=0.7, label="межкласс", density=True)
+    plt.hist(js_same, bins=bins, alpha=0.7, label="внутрикласс", density=True)
+    plt.xlabel("Jaccard(Z_i, Z_j)"); plt.ylabel("плотность")
+    plt.title(f"{dset_name}: Jaccard внутри vs между")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{dset_name}_jaccard_within_vs_between.png", dpi=160); plt.close()
+
+    print("\n=== Близость по эмбеддингам (сводка) ===")
+    print(f"Средний Жаккар внутри класса: {float(js_same.mean()):.3f} | между классами: {float(js_diff.mean()):.3f}")
+    for ci, c in enumerate(labels):
+        order = np.argsort(-Mt[ci])
+        # пропускаем себя [0], берём парочку ближайших
+        neigh = [(labels[j], float(Mt[ci, j])) for j in order if j != ci][:3]
+        txt = ", ".join([f"{nb}:{sim:.2f}" for nb, sim in neigh])
+        print(f"Класс {c} ближайшие (Tanimoto): {txt}")

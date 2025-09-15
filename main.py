@@ -5,9 +5,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 from damp_light import (
-    PrimaryEncoder, Layout2D, DetectorSpace, KNNJaccard,
+    KNNJaccard,
     load_mnist_28x28, to01
 )
+from training_cache import load_or_train
 from viz import save_embedding_core_heatmap, show_semantic_closeness
 
 
@@ -29,38 +30,9 @@ def main(digit: int = 0) -> None:
         )
         img_hw = (8, 8)
 
-    enc = PrimaryEncoder(
-        img_hw=img_hw, bits=8192,
-        grid_g=4, grid_levels=4, grid_bits_per_cell=3,
-        coarse_bits_per_cell=4,
-        bright_levels=8,
-        orient_on=True, orient_bins=8, orient_grid=4,
-        orient_bits_per_cell=2, orient_mag_thresh=0.12,
-        max_active_bits=260
+    enc, lay, det, Z_train, Z_test = load_or_train(
+        X_train, X_test, y_train, img_hw
     )
-
-    codes_train = [enc.encode(img) for img in X_train]
-    codes_test  = [enc.encode(img) for img in X_test]
-
-    lay = Layout2D(R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123)
-    lay.fit(codes_train)
-
-    det = DetectorSpace(
-        lay, codes_train, y_train,
-        emb_bits=256,
-        lam_floor=0.06,
-        percentile=0.88,
-        min_activated=35,
-        mu=0.20,
-        seeds=1200,
-        min_comp=5,
-        min_center_dist=1.6,
-        max_detectors=512,
-        seed=7
-    )
-
-    Z_train = [det.embed(c) for c in codes_train]
-    Z_test  = [det.embed(c) for c in codes_test]
 
     clf = KNNJaccard(k=5).fit(Z_train, y_train)
     y_pred = clf.predict(Z_test)

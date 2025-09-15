@@ -5,8 +5,9 @@ from damp_light import PrimaryEncoder, Layout2D, DetectorSpace
 
 CACHE_FILE = "training_cache.pkl"
 
-def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE):
+def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE, dset: str = "mnist"):
     """Возвращает модели и эмбеддинги, используя сохранённое состояние при наличии."""
+    cache_path = f"{dset}_{cache_path}"
     if os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
             enc, lay, det, Z_train, Z_test = pickle.load(f)
@@ -34,7 +35,7 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
             seeds=1200,
             min_comp=5,
             min_center_dist=1.6,
-            max_detectors=512,
+            max_detectors=256,
             seed=7
         )
         Z_train = [det.embed(c) for c in codes_train]

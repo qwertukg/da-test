@@ -1,21 +1,10 @@
-import math, random
-from collections import deque, Counter
-from typing import List, Tuple, Dict, Set, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from sklearn.datasets import load_digits
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from torchvision import transforms
-from torchvision.datasets import MNIST
 import matplotlib.pyplot as plt
-from sklearn.manifold import MDS
-import json, datetime as dt
-from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
 
-from damp_light import *
+from damp_light import DetectorSpace, KNNJaccard
 
 
 def _grid_for_bits(total_bits: int) -> Tuple[int, int]:

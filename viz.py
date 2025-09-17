@@ -1,21 +1,18 @@
-import math, random
-from collections import deque, Counter
-from typing import List, Tuple, Dict, Set, Optional
+from __future__ import annotations
 
-import numpy as np
-from sklearn.datasets import load_digits
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from torchvision import transforms
-from torchvision.datasets import MNIST
+import random
+from collections import Counter
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Set, Tuple
+
 import matplotlib.pyplot as plt
-from sklearn.manifold import MDS
-import json, datetime as dt
-from pathlib import Path
+import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
+from sklearn.manifold import MDS
 
-from damp_light import *
+from damp_light import DetectorSpace, KNNJaccard
+
+if TYPE_CHECKING:
+    from damp_light import Layout2D, PrimaryEncoder
 
 
 def _grid_for_bits(total_bits: int) -> Tuple[int, int]:
@@ -44,25 +41,67 @@ def _draw_detector_outline(ax, d, color="tab:red", lw=1.5):
         ax.plot([cx], [cy], marker="o", ms=3, color=color)
 
 
+_GEOM_EPS = 1e-9
+
+
+def _iter_detector_cells(det: Dict[str, object], height: int, width: int) -> Iterator[Tuple[int, int]]:
+    """Перечисляет целочисленные координаты внутри фигуры детектора."""
+
+    cy, cx = det["center"]
+    cy = float(cy)
+    cx = float(cx)
+
+    if det.get("shape") == "ellipse":
+        u1 = det["u1"]
+        u2 = det["u2"]
+        r1 = float(det["r1"])
+        r2 = float(det["r2"])
+        if r1 <= 0 or r2 <= 0:
+            return
+        padding = r1 + r2
+        y0 = max(0, int(np.floor(cy - padding)))
+        y1 = min(height - 1, int(np.ceil(cy + padding)))
+        x0 = max(0, int(np.floor(cx - padding)))
+        x1 = min(width - 1, int(np.ceil(cx + padding)))
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                vy = y - cy
+                vx = x - cx
+                a = (vy * u1[0] + vx * u1[1]) / (r1 + _GEOM_EPS)
+                b = (vy * u2[0] + vx * u2[1]) / (r2 + _GEOM_EPS)
+                if (a * a + b * b) <= 1.0:
+                    yield y, x
+    else:
+        radius = float(det["radius"])
+        if radius <= 0:
+            return
+        y0 = max(0, int(np.floor(cy - radius)))
+        y1 = min(height - 1, int(np.ceil(cy + radius)))
+        x0 = max(0, int(np.floor(cx - radius)))
+        x1 = min(width - 1, int(np.ceil(cx + radius)))
+        r_sq = radius * radius + _GEOM_EPS
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                if (y - cy) ** 2 + (x - cx) ** 2 <= r_sq:
+                    yield y, x
+
+
 def visualize_pipeline(img: np.ndarray,
-                       enc: "PrimaryEncoder",
-                       lay: "Layout2D",
-                       det: "DetectorSpace",
-                       clf: Optional["KNNJaccard"]=None,
+                       enc: PrimaryEncoder,
+                       lay: Layout2D,
+                       det: DetectorSpace,
+                       clf: Optional[KNNJaccard] = None,
                        true_label: Optional[int]=None,
                        title: str = "От стимула к смыслу",
                        show: bool = False,
                        overlay_weight: str = "activation",   # "activation" | "uniform"
                        overlay_only_fired: bool = True,
                        overlay_cmap: str = "inferno"):
-    """
-    Показывает весь конвейер:
-      1) исходное изображение
-      2) активные биты первичного кода
-      3) карта активации на раскладке
-      4) сработавшие детекторы (контуры)
-      5) финальный эмбеддинг (битовое полотно)
-      6) (если clf) предсказание kNN
+    """Собирает иллюстрацию всех этапов конвейера DAMP-light.
+
+    Параметр ``show`` позволяет сразу вывести фигуру, а возврат объекта
+    ``Figure`` даёт возможность сохранить или дополнительно обработать
+    визуализацию вне функции.
     """
     # 1) первичный код
     code = enc.encode(img)
@@ -73,7 +112,13 @@ def visualize_pipeline(img: np.ndarray,
     H, W = act.shape
 
     # карта-накопитель детекторов для этого стимула
-    ov = detector_overlay_matrix(code, det, only_fired=True, weight=overlay_weight, normalize=True)
+    ov = detector_overlay_matrix(
+        code,
+        det,
+        only_fired=overlay_only_fired,
+        weight=overlay_weight,
+        normalize=True,
+    )
 
     # 3) эмбеддинг и сработавшие детекторы
     ones = det.embed(code)  # множество активных битов
@@ -171,11 +216,13 @@ def visualize_pipeline(img: np.ndarray,
     )
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    if show:
+        plt.show()
     return fig
 
 
 def detector_overlay_matrix(code: Set[int],
-                            det: "DetectorSpace",
+                            det: DetectorSpace,
                             only_fired: bool = True,
                             weight: str = "activation",   # "uniform" | "activation"
                             normalize: bool = True) -> np.ndarray:
@@ -199,71 +246,25 @@ def detector_overlay_matrix(code: Set[int],
     # булева карта схожести (адаптивный порог), пригодится для weight="activation"
     act = det._activation_map_adaptive(code)
 
-    def det_fired(d) -> bool:
-        # тот же критерий, что в det.embed()
-        cy, cx = d["center"]
-        if d.get("shape") == "ellipse":
-            u1, u2 = d["u1"], d["u2"]; r1, r2 = d["r1"], d["r2"]
-            y0, y1 = max(0, int(cy - r1 - r2)), min(H - 1, int(cy + r1 + r2) + 1)
-            x0, x1 = max(0, int(cx - r1 - r2)), min(W - 1, int(cx + r1 + r2) + 1)
-            tot = hit = 0
-            for y in range(y0, y1 + 1):
-                for x in range(x0, x1 + 1):
-                    vy, vx = (y - cy), (x - cx)
-                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
-                    b = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
-                    if (a*a + b*b) <= 1.0:
-                        tot += 1
-                        if act[y, x]: hit += 1
-            return (tot > 0) and ((hit / tot) >= det.mu)
-        else:
-            r = d["radius"]
-            y0, y1 = max(0, int(cy - r)), min(H - 1, int(cy + r) + 1)
-            x0, x1 = max(0, int(cx - r)), min(W - 1, int(cx + r) + 1)
-            tot = hit = 0
-            for y in range(y0, y1 + 1):
-                for x in range(x0, x1 + 1):
-                    if (y - cy) ** 2 + (x - cx) ** 2 <= r ** 2 + 1e-9:
-                        tot += 1
-                        if act[y, x]: hit += 1
-            return (tot > 0) and ((hit / tot) >= det.mu)
+    def _cells_to_use(d) -> Optional[List[Tuple[int, int]]]:
+        cells = list(_iter_detector_cells(d, H, W))
+        if not cells:
+            return None
+        if not only_fired:
+            return cells
+        hits = sum(1 for (y, x) in cells if act[y, x])
+        return cells if (hits / len(cells)) >= det.mu else None
 
-    def add_region(d):
-        cy, cx = d["center"]
-        if d.get("shape") == "ellipse":
-            u1, u2 = d["u1"], d["u2"]; r1, r2 = d["r1"], d["r2"]
-            y0, y1 = max(0, int(cy - r1 - r2)), min(H - 1, int(cy + r1 + r2) + 1)
-            x0, x1 = max(0, int(cx - r1 - r2)), min(W - 1, int(cx + r1 + r2) + 1)
-            for y in range(y0, y1 + 1):
-                for x in range(x0, x1 + 1):
-                    vy, vx = (y - cy), (x - cx)
-                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
-                    b = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
-                    if (a*a + b*b) <= 1.0:
-                        if weight == "activation":
-                            overlay[y, x] += 1.0 if act[y, x] else 0.0
-                        else:
-                            overlay[y, x] += 1.0
+    for d in det.detectors:
+        cells = _cells_to_use(d)
+        if cells is None:
+            continue
+        if weight == "activation":
+            for y, x in cells:
+                overlay[y, x] += 1.0 if act[y, x] else 0.0
         else:
-            r = d["radius"]
-            y0, y1 = max(0, int(cy - r)), min(H - 1, int(cy + r) + 1)
-            x0, x1 = max(0, int(cx - r)), min(W - 1, int(cx + r) + 1)
-            for y in range(y0, y1 + 1):
-                for x in range(x0, x1 + 1):
-                    if (y - cy) ** 2 + (x - cx) ** 2 <= r ** 2 + 1e-9:
-                        if weight == "activation":
-                            overlay[y, x] += 1.0 if act[y, x] else 0.0
-                        else:
-                            overlay[y, x] += 1.0
-
-    # если хотим именно «сработавшие биты», вычислим по текущему коду
-    if only_fired:
-        for d in det.detectors:
-            if det_fired(d):
-                add_region(d)
-    else:
-        for d in det.detectors:
-            add_region(d)
+            for y, x in cells:
+                overlay[y, x] += 1.0
 
     if normalize and overlay.max() > 0:
         overlay = overlay / float(overlay.max())
@@ -273,8 +274,8 @@ def detector_overlay_matrix(code: Set[int],
 def class_overlay_matrix(label: int,
                          X: List[np.ndarray],
                          y: List[int],
-                         enc: "PrimaryEncoder",
-                         det: "DetectorSpace",
+                         enc: PrimaryEncoder,
+                         det: DetectorSpace,
                          limit: int = 100,
                          weight: str = "activation",   # "uniform" | "activation"
                          normalize: bool = True) -> np.ndarray:
@@ -313,8 +314,8 @@ def class_overlay_matrix(label: int,
 def save_class_overlay_pdf(label: int,
                            X: List[np.ndarray],
                            y: List[int],
-                           enc: "PrimaryEncoder",
-                           det: "DetectorSpace",
+                           enc: PrimaryEncoder,
+                           det: DetectorSpace,
                            limit: int = 100,
                            weight: str = "activation",   # "uniform" | "activation"
                            normalize: bool = True,
@@ -329,7 +330,6 @@ def save_class_overlay_pdf(label: int,
     pdf_path = pdf_path or f"class_{label}_overlay_limit{limit}_{weight}.pdf"
 
     with PdfPages(pdf_path) as pdf:
-        import matplotlib.pyplot as plt
         fig = plt.figure(figsize=(6, 6))
         ax = fig.add_subplot(1, 1, 1)
         ax.imshow(overlay, cmap=cmap, origin="upper")
@@ -353,7 +353,6 @@ def embedding_core_heatmap(label: int, Z: List[Set[int]], y: List[int], det: Det
     idxs = [i for i, yy in enumerate(y) if int(yy) == int(label)]
     if not idxs:
         return np.zeros((H, W), dtype=np.float32)
-    from collections import Counter
     cnt = Counter()
     for i in idxs:
         for b in Z[i]:
@@ -369,48 +368,12 @@ def embedding_core_heatmap(label: int, Z: List[Set[int]], y: List[int], det: Det
             continue
         cy, cx = d["center"]
 
-        if d.get("shape") == "ellipse":
-            u1, u2 = d["u1"], d["u2"]; r1, r2 = float(d["r1"]), float(d["r2"])
-            y0, y1 = max(0, int(cy - r1 - r2)), min(H - 1, int(cy + r1 + r2) + 1)
-            x0, x1 = max(0, int(cx - r1 - r2)), min(W - 1, int(cx + r1 + r2) + 1)
-            if y1 < y0 or x1 < x0:
-                continue
-            area = 0
-            for yv in range(y0, y1 + 1):
-                for xv in range(x0, x1 + 1):
-                    vy, vx = (yv - cy), (xv - cx)
-                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
-                    b2 = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
-                    if (a * a + b2 * b2) <= 1.0:
-                        area += 1
-            if area == 0:
-                continue
-            add = (p / area) if area_equalize else p
-            for yv in range(y0, y1 + 1):
-                for xv in range(x0, x1 + 1):
-                    vy, vx = (yv - cy), (xv - cx)
-                    a = (vy * u1[0] + vx * u1[1]) / (r1 + 1e-9)
-                    b2 = (vy * u2[0] + vx * u2[1]) / (r2 + 1e-9)
-                    if (a * a + b2 * b2) <= 1.0:
-                        heat[yv, xv] += add
-        else:
-            r = float(d["radius"])
-            y0, y1 = max(0, int(cy - r)), min(H - 1, int(cy + r) + 1)
-            x0, x1 = max(0, int(cx - r)), min(W - 1, int(cx + r) + 1)
-            if y1 < y0 or x1 < x0:
-                continue
-            area = 0
-            for yv in range(y0, y1 + 1):
-                for xv in range(x0, x1 + 1):
-                    if (yv - cy) ** 2 + (xv - cx) ** 2 <= r ** 2 + 1e-9:
-                        area += 1
-            if area == 0:
-                continue
-            add = (p / area) if area_equalize else p
-            for yv in range(y0, y1 + 1):
-                for xv in range(x0, x1 + 1):
-                    if (yv - cy) ** 2 + (xv - cx) ** 2 <= r ** 2 + 1e-9:
-                        heat[yv, xv] += add
+        cells = list(_iter_detector_cells(d, H, W))
+        if not cells:
+            continue
+        add = (p / len(cells)) if area_equalize else p
+        for yv, xv in cells:
+            heat[yv, xv] += add
 
     if normalize and heat.max() > 0:
         heat = heat / float(heat.max())
@@ -450,9 +413,6 @@ def show_semantic_closeness(Z: List[Set[int]], y: List[int], det: DetectorSpace,
       - распределения Жаккара: внутри класса vs между классами
     Сохраняет четыре PNG и печатает сводку/топ-соседей классов.
     """
-    import numpy as np, matplotlib.pyplot as plt, random
-    from sklearn.manifold import MDS
-
     labels = sorted({int(c) for c in y})
     C = len(labels)
     emb_bits = det.emb_bits

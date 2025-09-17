@@ -7,12 +7,6 @@ from dl_utils import cosbin
 
 
 # ========== вспомогательные ==========
-# def cosbin(a: Set[int], b: Set[int]) -> float:
-#     if not a or not b:
-#         return 0.0
-#     inter = len(a & b)
-#     return inter / math.sqrt(len(a) * len(b))
-
 def rgb_from_bits(bits: Set[int]) -> Tuple[int, int, int]:
     key = ",".join(map(str, sorted(bits)))
     h = hashlib.sha256(key.encode("utf-8")).digest()
@@ -250,4 +244,4 @@ def rr_log_layout(lay: Layout2DNew, codes: List[Set[int]], tag="layout", step=0)
         pos[i] = (x, y)
         col[i] = np.array(rgb_from_bits(codes[i]), dtype=np.uint8)
     rr.set_time_sequence("step", step)
-    rr.log(f"layout", rr.Points2D(positions=pos, colors=col))
+    rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))

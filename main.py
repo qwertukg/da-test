@@ -15,7 +15,7 @@ from viz import save_embedding_core_heatmap, show_semantic_closeness, visualize_
 
 def main(digit: int = 0) -> None:
     """Запускает полный цикл обучения и оценки для одной цифры."""
-    dset = "sklearn"
+    dset = "mnist"
     count = 100
     if dset == "mnist":
         X_train, X_test, y_train, y_test = load_mnist_28x28(
@@ -51,7 +51,7 @@ def main(digit: int = 0) -> None:
         return float(np.mean([len(z) for z in ZZ])) if ZZ else 0.0
 
     print(f"Обучающая выборка: {len(X_train)}, тест: {len(X_test)}")
-    print(f"Код: первичный B={enc.B}, целевая плотность ≤ {enc.max_active} бит; эмбеддинг E={det.emb_bits} бит.")
+    print(f"Код: первичный B={enc.B}, целевая плотность ≤ {enc.max_active_bits} бит; эмбеддинг E={det.emb_bits} бит.")
     print(f"Раскладка: сетка {lay.grid_shape()}, детекторов: {len(det.detectors)}")
     print(f"Среднее #битов в эмбеддинге: train={avg_bits(Z_train):.1f}, test={avg_bits(Z_test):.1f}")
     print(f"kNN(k=5) по Жаккару — accuracy: {acc:.4f}")

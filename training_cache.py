@@ -104,7 +104,7 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
         unique_bits=True,
         grid_shape=(7, 7),
         seed=42,
-        overlap=1
+        overlap=3
     )
 
     codes_train = [enc.encode(img, y) for img, y in zip(X_train, y_train)]

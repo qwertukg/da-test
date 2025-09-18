@@ -29,34 +29,15 @@ from rkse_sobel_layout import Layout2DNew
 
 class PrimaryEncoderKeyholeSobel:
     """
-    Первичный энкодер на одном канале ORIENT (Собель) через «замочную скважину».
+    Энкодер «замочная скважина» только по УГЛУ (Sobel). Величина градиента полностью игнорируется.
 
-    Идея:
-      - Берём K скважин (малые окна S×S) вблизи центров на изображении.
-      - Для каждой скважины считаем направления градиента (Собель), строим
-        взвешенную гистограмму по orient_bins бинам, выбираем доминирующий бин.
-      - Для тройки (y, x, bin) активируем заранее выделенные биты (bits_per_keyhole шт.).
-      - Объединяем биты по всем скважинам → получаем разрежённый код (set[int]).
+    Для каждой скважины S×S:
+      1) считаем gx, gy (Собель) один раз по всему изображению;
+      2) берём подокно углов ang = atan2(gy, gx) ∈ [0, 2π);
+      3) строим НЕвзвешенную гистограмму по orient_bins, выбираем доминирующий bin;
+      4) активируем биты, закреплённые за (y, x, bin).
 
-    Параметры:
-      img_hw: (H, W) размер изображения (например, (28, 28) для MNIST).
-      bits: размер «вселенной» битов (общее число возможных индексов битов).
-      keyholes_per_img: количество скважин K на изображение.
-      keyhole_size: размер окна скважины (нечётный), обычно 5.
-      orient_bins: число ориентационных корзин (направлений), напр. 8 или 12.
-      bits_per_keyhole: сколько бит выдаёт одна тройка (y, x, bin).
-      mag_thresh: порог «средней силы градиента» для принятия скважины.
-      max_active_bits: опциональное ограничение на итоговое число активных битов (top-K).
-      deterministic: детерминированный выбор скважин в режиме random (по хэшу изображения).
-      seed: общий сид ГСЧ.
-      unique_bits: если True — каждому (y,x,bin) назначаются уникальные (глобально) биты.
-      centers_mode: "grid" (равномерная решётка центров, одинаковая для всех картинок)
-                    или "random" (случайный выбор центров).
-      grid_shape: (Gh, Gw) если centers_mode="grid"; например (14,14) для 196 скважин.
-
-    Атрибуты, полезные для визуализаций:
-      bit2yxb: Dict[int, (y, x, bin)] — обратная карта для каждого выделенного бита.
-               С её помощью можно окрасить «пинвил» по ориентациям и позициям.
+    Примечание: параметр mag_thresh сохранён в __init__ только ради совместимости и не используется.
     """
 
     def __init__(self,
@@ -66,125 +47,84 @@ class PrimaryEncoderKeyholeSobel:
                  keyhole_size: int = 5,
                  orient_bins: int = 12,
                  bits_per_keyhole: int = 1,
-                 mag_thresh: float = 0.10,
                  max_active_bits: Optional[int] = None,
                  deterministic: bool = False,
                  seed: int = 42,
-                 unique_bits = True,
-                 centers_mode: str = "grid",           # "grid" или "random"
-                 grid_shape: Optional[Tuple[int, int]] = None):
-        # --- геометрия/пул битов ---
+                 unique_bits: bool = True,
+                 centers_mode: str = "grid",              # "grid" или "random"
+                 grid_shape: Optional[Tuple[int, int]] = None,
+                 overlap: int = 3):
         self.H, self.W = img_hw
-        self.B = bits
+        self.B = int(bits)
         self.K = int(keyholes_per_img)
         self.S = int(keyhole_size)
-        assert self.S % 2 == 1, "keyhole_size должно быть нечётным (например, 5)"
+        assert self.S % 2 == 1, "keyhole_size должен быть нечётным (например, 5)"
         self.orient_bins = int(orient_bins)
         self.bits_per_keyhole = int(bits_per_keyhole)
-        self.mag_thresh = float(mag_thresh)
         self.max_active_bits = max_active_bits if max_active_bits is None else int(max_active_bits)
 
-        # --- выбор центров скважин ---
         self.deterministic = bool(deterministic)
         self.centers_mode = centers_mode
-        self.grid_shape = grid_shape  # (Gh, Gw) или None
+        self.grid_shape = grid_shape
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
 
-        self.unique_bits = unique_bits
-        self.bit2info = {}  # bit -> {"y":int,"x":int,"bin":int}
+        self.unique_bits = bool(unique_bits)
+        self.bit2info: Dict[int, Dict[str, int]] = {}
         self._next_bit = 0
 
-        # --- кодбук и обратная карта ---
         self._codebook: Dict[Tuple[int, int, int], List[int]] = {}
         self._used_bits: Set[int] = set()
-        self.bit2yxb: Dict[int, Tuple[int, int, int]] = {}
+        self.bit2yxb: Dict[int, Tuple[int, int, int]] = {}  # если нужно, можно заполнять так же, как bit2info
+        self.overlap = overlap
 
-    # ======================================================================
-    # Публичный API
-    # ======================================================================
+    # ----------------------------- публичный API -----------------------------
 
-    def encode(self, img: np.ndarray) -> Set[int]:
-        """
-        img: 2D numpy, float32/float64, значения в [0,1], размер (H, W).
-        Возвращает: множество активных битов (set[int]).
-        """
+    def encode(self, img: np.ndarray, label: int | None = None) -> Set[int]:
         H, W = img.shape
         if (H, W) != (self.H, self.W):
             raise ValueError(f"Ожидался размер {(self.H, self.W)}, а пришёл {(H, W)}")
 
-        gx, gy = self._sobel(img)
-        mag = np.hypot(gx, gy)
-        ang = (np.arctan2(gy, gx) + np.pi)  # диапазон [0, 2π)
-
-        # Нормируем magnitude, чтобы порог был сопоставим на разных картинках.
-        mmax = float(np.max(mag))
-        mnorm = mag / (mmax + 1e-8) if mmax > 1e-8 else mag
-
         centers = self._pick_keyholes(img)  # список (cy, cx)
         active: Set[int] = set()
-        kept_any = False
 
         for (cy, cx) in centers:
             y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
-            tile_m = mnorm[y0:y1, x0:x1]
-            tile_a = ang[y0:y1, x0:x1]
+            tile = img[y0:y1, x0:x1]  # локальное окно S×S
 
-            # средняя «сила» скважины — фильтруем слабые
-            if float(np.mean(tile_m)) < self.mag_thresh:
+            # Sobel только в этом окне
+            gx, gy = self._sobel(tile)
+            mask = (gx * gx + gy * gy) > 1e-6
+            if mask.sum() < 6:  # <- ключевой порог, 4–8 обычно ок
                 continue
 
-            # индексы бинов направлений (веса = tile_m)
-            bidx = np.floor((tile_a / (2 * np.pi)) * self.orient_bins).astype(int) % self.orient_bins
-            # быстрая гистограмма с весами
-            hist = np.zeros(self.orient_bins, dtype=np.float32)
-            for b in range(self.orient_bins):
-                hist[b] = float(tile_m[bidx == b].sum())
+            ang = (np.arctan2(gy, gx) + np.pi)[mask]
+            bidx = np.floor((ang / (2 * np.pi)) * self.orient_bins).astype(int) % self.orient_bins
+            hist = np.bincount(bidx.ravel(), minlength=self.orient_bins)
             b_max = int(np.argmax(hist))
 
-            # назначаем биты под (y, x, b_max)
-            for bit in self._bits_for(cy, cx, b_max):
-                active.add(bit)
+            # ПЕЧАТЬ: x, y центра скважины и угол (в градусах)
+            angle_deg = (b_max + 0.5) * (180.0 / self.orient_bins)
+            print(f"[KEYHOLE] class={label} x={cx} y={cy} angle={angle_deg:.1f}°")
 
-            kept_any = True
+            for nb in (b_max - self.overlap, b_max, b_max + self.overlap):
+                bb = nb % self.orient_bins
+                for bit in self._bits_for(cy, cx, bb):
+                    active.add(bit)
 
-        # fallback: если все окна были «слабыми», возьмём самую сильную скважину
-        if not kept_any and centers:
-            strengths = []
-            for (cy, cx) in centers:
-                y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
-                strengths.append((float(np.mean(mnorm[y0:y1, x0:x1])), (cy, cx)))
-            strengths.sort(reverse=True)
-            (cy, cx) = strengths[0][1]
-            y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
-            tile_m = mnorm[y0:y1, x0:x1]
-            tile_a = ang[y0:y1, x0:x1]
-            bidx = np.floor((tile_a / (2 * np.pi)) * self.orient_bins).astype(int) % self.orient_bins
-            hist = np.zeros(self.orient_bins, dtype=np.float32)
-            for b in range(self.orient_bins):
-                hist[b] = float(tile_m[bidx == b].sum())
-            b_max = int(np.argmax(hist))
-            for bit in self._bits_for(cy, cx, b_max):
-                active.add(bit)
-
-        # (опционально) жёстко ограничим число активных битов
-        if self.max_active_bits is not None and len(active) > self.max_active_bits:
-            active = set(sorted(active)[: self.max_active_bits])
+            # активируем биты для (y, x, b_max)
+            # for bit in self._bits_for(cy, cx, b_max):
+            #     active.add(bit)
 
         return active
 
-    # ======================================================================
-    # Служебные методы
-    # ======================================================================
+    # ----------------------------- служебка -----------------------------
 
     def _pick_keyholes(self, img: np.ndarray) -> List[Tuple[int, int]]:
-        """Вернёт список центров скважин (cy, cx)."""
         pad = self.S // 2
 
         if self.centers_mode == "grid":
-            # равномерная решётка (одинакова для всех изображений)
             if self.grid_shape is None:
-                # находим квадратную решётку примерно под K
                 side = int(round(np.sqrt(self.K)))
                 gh, gw = max(1, side), max(1, side)
             else:
@@ -194,12 +134,8 @@ class PrimaryEncoderKeyholeSobel:
             ys = np.linspace(pad, self.H - 1 - pad, gh).round().astype(int)
             xs = np.linspace(pad, self.W - 1 - pad, gw).round().astype(int)
             centers = [(int(y), int(x)) for y in ys for x in xs]
-            # обрежем до K при необходимости
-            if len(centers) > self.K:
-                centers = centers[: self.K]
-            return centers
+            return centers[: self.K]
 
-        # режим "random"
         ys = list(range(pad, self.H - pad))
         xs = list(range(pad, self.W - pad))
         all_centers = [(y, x) for y in ys for x in xs]
@@ -207,7 +143,6 @@ class PrimaryEncoderKeyholeSobel:
             return []
 
         if self.deterministic:
-            # сид от содержимого изображения (стабильно между запусками)
             import hashlib
             h = hashlib.sha256(img.astype(np.float32).tobytes()).digest()
             seed_img = int.from_bytes(h[:8], "little") ^ self.seed
@@ -220,13 +155,10 @@ class PrimaryEncoderKeyholeSobel:
 
     def _window_bounds(self, cy: int, cx: int, H: int, W: int) -> Tuple[int, int, int, int]:
         r = self.S // 2
-        y0 = max(0, cy - r)
-        y1 = min(H, cy + r + 1)
-        x0 = max(0, cx - r)
-        x1 = min(W, cx + r + 1)
+        y0 = max(0, cy - r); y1 = min(H, cy + r + 1)
+        x0 = max(0, cx - r); x1 = min(W, cx + r + 1)
         return y0, y1, x0, x1
 
-    # замена _bits_for (гарантируем уникальность и регистрируем метаданные)
     def _bits_for(self, y: int, x: int, b: int) -> List[int]:
         key = (int(y), int(x), int(b))
         if key not in self._codebook:
@@ -241,56 +173,14 @@ class PrimaryEncoderKeyholeSobel:
                     self.bit2info[bit] = {"y": int(y), "x": int(x), "bin": int(b)}
                 self._codebook[key] = ids
             else:
-                self._codebook[key] = self._rand_bits(self.bits_per_keyhole)
-                for bit in self._codebook[key]:
+                ids = self._rand_bits(self.bits_per_keyhole)
+                self._codebook[key] = ids
+                for bit in ids:
                     self.bit2info.setdefault(bit, {"y": int(y), "x": int(x), "bin": int(b)})
         return self._codebook[key]
 
-    # вспомогательное: угол/селективность из кода
-    def code_dominant_orientation(self, code: set[int]) -> tuple[float, float]:
-        """Возвращает (угол в [0, π), селективность в [0,1])."""
-        if not code:
-            return 0.0, 0.0
-        # считаем глобальную гистограмму по ориентационным корзинам
-        hist = np.zeros(self.orient_bins, dtype=np.float32)
-        for bit in code:
-            info = self.bit2info.get(int(bit))
-            if info is None:
-                continue
-            hist[info["bin"]] += 1.0
-        if hist.sum() <= 0:
-            return 0.0, 0.0
-        b_max = int(hist.argmax())
-        # ориентация — без направленности (π-периодическая): центр корзины
-        angle = (b_max + 0.5) * (np.pi / self.orient_bins)  # ∈ [0, π)
-        selectivity = float(hist[b_max] / (hist.sum() + 1e-9))  # чем ближе к 1, тем «уже» тюнинг
-        return angle, selectivity
-
-    def _alloc_unique_bits(self, k: int) -> List[int]:
-        """Выделяет k ранее неиспользованных битов из диапазона [0, B)."""
-        out: List[int] = []
-        tries = 0
-        while len(out) < k:
-            tries += 1
-            # быстрый выход, если битов не хватает
-            if tries > 10000 and (self.B - len(self._used_bits)) < (k - len(out)):
-                raise RuntimeError(
-                    "Недостаточно свободных битов при unique_bits=True: "
-                    f"нужно ещё {k - len(out)}, свободно {self.B - len(self._used_bits)}."
-                )
-            cand = self.rng.randrange(self.B)
-            if cand in self._used_bits:
-                continue
-            self._used_bits.add(cand)
-            out.append(cand)
-        return out
-
     def _rand_bits(self, k: int) -> List[int]:
-        """Выдаёт k случайных битов (могут повторяться для разных (y,x,bin))."""
-        # Без уникальности: допускаем переиспользование битов на разных ключах
         return self.rng.sample(range(self.B), k)
-
-    # ---------- Собель 3×3 ----------
 
     @staticmethod
     def _sobel(img01: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -316,21 +206,23 @@ class PrimaryEncoderKeyholeSobel:
                 out[y, x] = float(np.sum(patch * k))
         return out
 
-    # ---------- Вспомогательные методы (необязательные) ----------
-
-    def get_keyhole_centers_grid(self) -> List[Tuple[int, int]]:
-        """Вернёт центры скважин для текущей конфигурации в режиме 'grid' (полезно для отладки)."""
-        pad = self.S // 2
-        if self.grid_shape is None:
-            side = int(round(np.sqrt(self.K)))
-            gh, gw = max(1, side), max(1, side)
-        else:
-            gh, gw = self.grid_shape
-            gh = max(1, int(gh)); gw = max(1, int(gw))
-        ys = np.linspace(pad, self.H - 1 - pad, gh).round().astype(int)
-        xs = np.linspace(pad, self.W - 1 - pad, gw).round().astype(int)
-        centers = [(int(y), int(x)) for y in ys for x in xs]
-        return centers[: self.K]
+    # полезно для визуализации (осталось без изменений)
+    def code_dominant_orientation(self, code: Set[int]) -> Tuple[float, float]:
+        """(угол в [0, π), селективность в [0,1]) по распределению БИТОВ по корзинам."""
+        if not code:
+            return 0.0, 0.0
+        hist = np.zeros(self.orient_bins, dtype=np.float32)
+        for bit in code:
+            info = self.bit2info.get(int(bit))
+            if info is None:
+                continue
+            hist[info["bin"]] += 1.0
+        if hist.sum() <= 0:
+            return 0.0, 0.0
+        b_max = int(hist.argmax())
+        angle = (b_max + 0.5) * (np.pi / self.orient_bins)  # π-периодичность
+        selectivity = float(hist[b_max] / (hist.sum() + 1e-9))
+        return angle, selectivity
 
 
 # ============================================================

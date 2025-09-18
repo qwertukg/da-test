@@ -94,21 +94,20 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
     enc = PrimaryEncoderKeyholeSobel(
         img_hw=(28, 28),
         bits=1024,
-        keyholes_per_img=25,  # 5×5
-        keyhole_size=9,
-        orient_bins=6,
-        bits_per_keyhole=12,
-        mag_thresh=0.30,
+        keyholes_per_img=49,  # 5×5
+        keyhole_size=5,
+        orient_bins=12,
+        bits_per_keyhole=1,
         max_active_bits=None,
         deterministic=False,
         centers_mode="grid",
-        unique_bits=False,
-        grid_shape=(5, 5),
-        seed=42
+        unique_bits=True,
+        grid_shape=(7, 7),
+        seed=42,
+        overlap=1
     )
 
-    codes_train = [enc.encode(img) for img in X_train]
-    codes_test  = [enc.encode(img) for img in X_test]
+    codes_train = [enc.encode(img, y) for img, y in zip(X_train, y_train)]
 
     rr_init("rkse+layout", spawn=True)
 
@@ -119,11 +118,11 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
         rr_log_layout_with_keyhole_prototypes(lay, enc, codes_train, X_train, tag=tag, max_prototypes=600)
 
     def on_epoch_dots(phase, ep, lay):
-        rr_log_layout(lay, codes_train, tag=f"layout/{phase}", step=ep)
+        rr_log_layout(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
 
     lay = Layout2DNew(
-        R_far=12, epochs_far=200,
-        R_near=3, epochs_near=200,
+        R_far=12, epochs_far=20,
+        R_near=2, epochs_near=10,
         seed=123
     )
     lay.fit(codes_train, on_epoch=on_epoch_dots)
@@ -147,6 +146,7 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
         seed=7,
     )
 
+    codes_test  = [enc.encode(img) for img in X_test]
     Z_train = [det.embed(c) for c in codes_train]
     Z_test  = [det.embed(c) for c in codes_test]
 

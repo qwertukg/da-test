@@ -13,8 +13,10 @@
 ## Зависимости
 Проект не требует специальных фреймворков, достаточно стандартного стека научного Python. Установите:
 
+Сделайте виртуальное окружение `python -m venv venv` и активируйте его через `venv\Scripts\activate.ps1` (Windows) или `venv\activate` (Linux).
+Установите зависимости: `pip install -r requirements.txt`.
 ```bash
-pip install numpy matplotlib scikit-learn torchvision rerun
+pip install -r requirements.txt
 ```
 
 `rerun` используется для стриминговых визуализаций раскладки и детекторов. Если он не нужен, можно заменить импорт в `training_cache.py` на заглушку, но по умолчанию библиотека обязательна: без неё `load_or_train` не запустится.

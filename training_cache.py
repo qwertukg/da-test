@@ -93,7 +93,7 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
     # --- Энкодер: RKSE (Собель + keyholes) ---
     enc = PrimaryEncoderKeyholeSobel(
         img_hw=(28, 28),
-        bits=2048,
+        bits=1024,
         keyholes_per_img=25,  # 5×5
         keyhole_size=9,
         orient_bins=6,
@@ -122,8 +122,8 @@ def load_or_train(X_train, X_test, y_train, img_hw, cache_path: str = CACHE_FILE
         rr_log_layout(lay, codes_train, tag=f"layout/{phase}", step=ep)
 
     lay = Layout2DNew(
-        R_far=12, epochs_far=100,
-        R_near=3, epochs_near=100,
+        R_far=12, epochs_far=200,
+        R_near=3, epochs_near=200,
         seed=123
     )
     lay.fit(codes_train, on_epoch=on_epoch_dots)

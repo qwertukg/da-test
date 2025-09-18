@@ -1,3 +1,6 @@
 __pycache__/
 venv/
 data/
+*.png
+*.pdf
+*.pkl

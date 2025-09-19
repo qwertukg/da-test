@@ -46,15 +46,14 @@ def rgb_from_bits(bits: Set[int]) -> Tuple[int, int, int]:
 
 
 def rr_log_layout(lay: Layout2D, codes: List[Set[int]], tag="layout", step=0):
-    import rerun as rr
-    H, W = lay.grid_shape(); N = len(codes)
+    N = len(codes)
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
     for i in range(N):
         y, x = lay.position_of(i)
         pos[i] = (x, y)
         col[i] = np.array(rgb_from_bits(codes[i]), dtype=np.uint8)
-    rr.set_time_sequence("step", step)
+    rr.set_time("step", sequence=step)
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
 
 

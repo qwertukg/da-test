@@ -13,7 +13,6 @@ from src.RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
 
 
 def load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0):
-    """Грузит и подсэмплирует MNIST (28×28, 0..1)."""
     tfm = transforms.ToTensor()
     train_ds = MNIST(root="./data", train=True, download=True, transform=tfm)
     test_ds = MNIST(root="./data", train=False, download=True, transform=tfm)
@@ -35,10 +34,8 @@ def load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0):
 
 
 def rr_init(app_name: str = "digits-layout", spawn: bool = True, class_labels=None):
-    """Инициализирует Rerun Viewer (опционально)."""
     rr.init(app_name, spawn=spawn)
     if class_labels is not None:
-        # class_labels: {id:int -> label:str}
         ann = [AnnotationInfo(id=int(i), label=str(lbl)) for i, lbl in class_labels.items()]
         rr.log("layout", rr.AnnotationContext(ann), static=True)
 
@@ -46,10 +43,9 @@ def rr_init(app_name: str = "digits-layout", spawn: bool = True, class_labels=No
 def rgb_from_bits(bits: Set[int]) -> Tuple[int, int, int]:
     key = ",".join(map(str, sorted(bits)))
     h = hashlib.sha256(key.encode("utf-8")).digest()
-    return (h[0], h[1], h[2])  # 0..255
+    return (h[0], h[1], h[2])
 
 
-# Цвет по углу (experimental)
 def rgb_from_angle(angle_rad: float):
     h = (angle_rad / np.pi) % 1.0
     r, g, b = (hsv_to_rgb([[h, 1.0, 1.0]])[0] * 255).astype(np.uint8)
@@ -75,7 +71,7 @@ def rr_log_layout_col(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", s
     for i, code in enumerate(codes):
         y, x = lay.position_of(i)
         pos[i] = (x, y)
-        angle, sel = enc.code_dominant_orientation(code)  # доминирующий угол и селективность
+        angle, sel = enc.code_dominant_orientation(code)
         col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
     rr.set_time("step", sequence=step)
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
@@ -92,7 +88,7 @@ def run() -> None:
     enc = RandomKeyholeSamplingEncoder(
         img_hw=(28, 28),
         bits=256,
-        keyholes_per_img=25,  # 5×5
+        keyholes_per_img=25,
         keyhole_size=9,
         orient_bins=6,
         bits_per_keyhole=12,

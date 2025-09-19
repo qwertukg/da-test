@@ -213,8 +213,6 @@ class RandomKeyholeSamplingEncoder:
 
         return self.rng.sample(range(self.B), k)
 
-    # ---------- Собель 3×3 ----------
-
     @staticmethod
     def _sobel(img01: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         kx = np.array([[-1, 0, 1],
@@ -239,10 +237,7 @@ class RandomKeyholeSamplingEncoder:
                 out[y, x] = float(np.sum(patch * k))
         return out
 
-    # ---------- Вспомогательные методы (необязательные) ----------
-
     def get_keyhole_centers_grid(self) -> List[Tuple[int, int]]:
-        """Вернёт центры скважин для текущей конфигурации в режиме 'grid' (полезно для отладки)."""
         pad = self.S // 2
         if self.grid_shape is None:
             side = int(round(np.sqrt(self.K)))

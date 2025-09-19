@@ -1,6 +1,7 @@
 import random
 import math
 import hashlib
+from itertools import product
 from typing import Optional, Dict, List, Set, Tuple
 
 import numpy as np
@@ -22,8 +23,8 @@ class RandomKeyholeSamplingEncoder:
                  angle_layers: Optional[List[Tuple[int, float]]] = None,
                  # --- сколько ближайших детекторов брать на каждом слое ---
                  detectors_per_layer: Optional[List[int]] = None,
-                 # --- сколько бит выдает один детектор ---
-                 bits_per_detector: int = 4,
+                 # --- целевое среднее число активных битов на детектор ---
+                 bits_per_detector: float = 4.0,
                  # --- отбор «неплоских» скважин ---
                  mag_eps: float = 0.03,
                  min_active_frac: float = 0.05,
@@ -54,7 +55,7 @@ class RandomKeyholeSamplingEncoder:
         assert len(detectors_per_layer) == len(self.angle_layers)
         self.detectors_per_layer: List[int] = [max(1, int(k)) for k in detectors_per_layer]
 
-        self.bits_per_detector = int(bits_per_detector)
+        self.bits_per_detector = float(bits_per_detector)
 
         # отбор «неплоских»
         self.mag_eps = float(mag_eps)
@@ -272,27 +273,154 @@ class RandomKeyholeSamplingEncoder:
         return float(np.angle(vec_sum) % (2 * np.pi))
 
     # ---- многослойные детекторы по углу ----
+    @staticmethod
+    def _popcount(x: int) -> int:
+        return int(x.bit_count())
+
+    @staticmethod
+    def _gray_sequence(n: int) -> Tuple[List[int], int]:
+        if n <= 0:
+            raise ValueError("число детекторов на слое должно быть положительным")
+        bits = max(1, int(math.ceil(math.log2(n))))
+        cycle_len = 1 << bits
+        sequence = [i ^ (i >> 1) for i in range(cycle_len)]
+        if n == cycle_len:
+            return sequence, bits
+        for start in range(cycle_len):
+            seg = [sequence[(start + i) % cycle_len] for i in range(n)]
+            if RandomKeyholeSamplingEncoder._popcount(seg[0] ^ seg[-1]) == 1:
+                return seg, bits
+        return sequence[:n], bits
+
     def _build_angle_layers(self) -> None:
         """Создаёт слои детекторов: для каждого центра фиксируем свой список битов."""
         self._layers.clear()
-        for L, (n, width) in enumerate(self.angle_layers):
-            n = int(n)
-            width = float(width)
+        if not self.angle_layers:
+            return
+
+        active_counts = [
+            min(self.detectors_per_layer[idx], int(self.angle_layers[idx][0]))
+            for idx in range(len(self.angle_layers))
+        ]
+        target_total = float(self.bits_per_detector) * sum(active_counts)
+        layer_specs = []
+        min_total = 0.0
+
+        for L, (n_raw, width_raw) in enumerate(self.angle_layers):
+            n = int(n_raw)
+            width = float(width_raw)
             mus = [2.0 * np.pi * j / n for j in range(n)]
-            bits_tbl = [self._det_bits(f"L{L}:DET{j}:{self.seed}", self.bits_per_detector)
-                        for j in range(n)]
-            self._layers.append({"n": n, "width": width, "mu": mus, "bits": bits_tbl})
+            gray_codes, gray_bits = self._gray_sequence(n)
+            weights = [self._popcount(code) for code in gray_codes]
+            avg_gray = float(sum(weights)) / n if n > 0 else 0.0
+            kL = active_counts[L]
+            min_total += avg_gray * kL
+            layer_specs.append({
+                "index": L,
+                "n": n,
+                "width": width,
+                "mu": mus,
+                "gray_bits": gray_bits,
+                "gray_codes": gray_codes,
+                "avg_gray": avg_gray,
+            })
+
+        if target_total < min_total - 1e-9:
+            raise ValueError(
+                "bits_per_detector слишком мало для реализации серого кода (см. DAML.pdf)"
+            )
+
+        choices: List[List[int]] = []
+        for spec in layer_specs:
+            diff = float(self.bits_per_detector) - spec["avg_gray"]
+            opts = {0}
+            if diff > 0:
+                base = max(0, int(math.floor(diff)))
+                opts.add(base)
+                if diff - base > 1e-9:
+                    opts.add(base + 1)
+            choices.append(sorted(opts))
+
+        best_consts: Optional[Tuple[int, ...]] = None
+        best_diff = float("inf")
+        best_total = float("inf")
+
+        for picks in product(*choices):
+            total = 0.0
+            for spec, const_bits in zip(layer_specs, picks):
+                avg = spec["avg_gray"] + const_bits
+                kL = active_counts[spec["index"]]
+                total += avg * kL
+            diff = abs(total - target_total)
+            better = False
+            if diff < best_diff - 1e-9:
+                better = True
+            elif abs(diff - best_diff) <= 1e-9:
+                curr_over = total > target_total + 1e-9
+                best_over = best_total > target_total + 1e-9
+                if best_consts is None or (best_over and not curr_over):
+                    better = True
+                elif curr_over == best_over and best_consts is not None:
+                    if sum(picks) < sum(best_consts):
+                        better = True
+            if better or best_consts is None:
+                best_consts = tuple(picks)
+                best_diff = diff
+                best_total = total
+
+        assert best_consts is not None
+
+        for spec, const_bits in zip(layer_specs, best_consts):
+            used: Set[int] = set()
+            const_list = self._det_bits(
+                f"L{spec['index']}:CONST:{self.seed}", const_bits, used=used
+            )
+            gray_pool = self._det_bits(
+                f"L{spec['index']}:GRAY:{self.seed}", spec["gray_bits"], used=used
+            )
+            bits_tbl: List[List[int]] = []
+            for code in spec["gray_codes"]:
+                bits = list(const_list)
+                for bit_pos in range(spec["gray_bits"]):
+                    if (code >> bit_pos) & 1:
+                        bits.append(gray_pool[bit_pos])
+                bits_tbl.append(bits)
+            self._layers.append({
+                "n": spec["n"],
+                "width": spec["width"],
+                "mu": spec["mu"],
+                "bits": bits_tbl,
+                "const_bits": const_list,
+                "gray_pool": gray_pool,
+                "avg_bits": spec["avg_gray"] + const_bits,
+            })
 
     @staticmethod
     def _circ_delta(a: float, b: float) -> float:
         """Минимальная круговая разность углов (0..π]."""
         return abs((a - b + np.pi) % (2.0 * np.pi) - np.pi)
 
-    def _det_bits(self, key: str, k: int) -> List[int]:
-        """Детерминированное отображение «детектор -> k битов»."""
+    def _det_bits(self, key: str, k: int, used: Optional[Set[int]] = None) -> List[int]:
+        """Детерминированное отображение «детектор -> k битов» с учётом уникальности."""
+        if k <= 0:
+            return []
+        used_bits: Set[int] = set() if used is None else set(used)
+        if k + len(used_bits) > self.B:
+            raise ValueError("недостаточно свободных битов для выделения под слой")
         h = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=16).digest(), 'little')
         step = 0x9E3779B97F4A7C15
-        return [int((h + i * step) % self.B) for i in range(k)]
+        bits: List[int] = []
+        i = 0
+        while len(bits) < k:
+            candidate = int((h + i * step) % self.B)
+            i += 1
+            if candidate in used_bits:
+                continue
+            bits.append(candidate)
+            used_bits.add(candidate)
+        if used is not None:
+            used.update(bits)
+        return bits
 
     def _angle_bits_per_layer(self, angle: float) -> List[int]:
         """

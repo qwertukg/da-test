@@ -58,47 +58,31 @@ def rr_log_layout_bits(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", 
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
 
 def rgb_from_angle(angle_rad: float):
-    a = float(angle_rad) % (2*np.pi)   # [0, 2π)
-    h = a / (2*np.pi)                  # [0, 1)
-    rgb01 = hsv_to_rgb([[h, 1.0, 1.0]])[0]   # shape (3,), floats 0..1
-    r, g, b = (rgb01 * 255).astype(np.uint8)
+    h = (angle_rad / (np.pi*2)) % 1.0
+    r, g, b = (hsv_to_rgb([[h, 1.0, 1.0]])[0] * 255).astype(np.uint8)
     return int(r), int(g), int(b)
 
-def rr_log_layout_ang(lay, enc, tag="layout", step=0):
-    """
-    Логирует точки (через rr.Points2D) и красит их по углу из enc.keyhole_records.
-    Требует, чтобы enc.encode(...) уже был вызван и enc.keyhole_records был заполнен.
-    """
-    import numpy as np
-    import math, colorsys
-
-    recs = getattr(enc, "keyhole_records", None)
-    if not recs:
-        print("enc.keyhole_records пуст. Сначала вызовите enc.encode(img).")
-        return
-
-    N = len(recs)
+def rr_log_layout_ang(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
+    N = len(codes)
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
-
-    for i, (angle_rad, _code) in enumerate(recs):
+    for i, code in enumerate(codes):
         y, x = lay.position_of(i)
         pos[i] = (x, y)
-
-        # угол -> оттенок (HSV), корректно по полному кругу 2π
-        h = (float(angle_rad) % (2 * math.pi)) / (2 * math.pi)  # [0,1)
-        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
-        col[i] = (int(r * 255 + 0.5), int(g * 255 + 0.5), int(b * 255 + 0.5))
-
+        angle, s = enc.code_dominant_orientation(code)
+        col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
     rr.set_time("step", sequence=step)
-    rr.log(tag, rr.Points2D(positions=pos, colors=col, radii=0.6))
+    rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
+
+
 
 
 def run() -> None:
     rr_init("rkse+layout", spawn=True)
 
     def on_epoch_dots(phase, ep, lay):
-        rr_log_layout_ang(lay, enc, tag=f"layout/{phase}", step=ep)
+        rr_log_layout_ang(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
+
 
     X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=100, test_limit=20, seed=0)
 

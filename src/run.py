@@ -8,14 +8,14 @@ from rerun.datatypes import AnnotationInfo
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
-from src.Layout2D import Layout2D
-from src.RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
+from Layout2D import Layout2D
+from RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
 
 
-def load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0):
+def load_mnist_28x28(train_limit=1000, test_limit=200, seed=0):
     tfm = transforms.ToTensor()
-    train_ds = MNIST(root="./data", train=True, download=True, transform=tfm)
-    test_ds = MNIST(root="./data", train=False, download=True, transform=tfm)
+    train_ds = MNIST(root="../data", train=True, download=True, transform=tfm)
+    test_ds = MNIST(root="../data", train=False, download=True, transform=tfm)
 
     rng = np.random.default_rng(seed)
     train_idx = np.arange(len(train_ds))
@@ -81,24 +81,24 @@ def run() -> None:
     rr_init("rkse+layout", spawn=True)
 
     def on_epoch_dots(phase, ep, lay):
-        rr_log_layout_bits(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
+        rr_log_layout_col(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
 
-    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0)
+    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=200, test_limit=20, seed=0)
 
     enc = RandomKeyholeSamplingEncoder(
         img_hw=(28, 28),
         bits=256,
-        keyholes_per_img=25,
-        keyhole_size=9,
-        bits_per_keyhole=12,
+        keyholes_per_img=20,
+        keyhole_size=5,
+        bits_per_keyhole=1,
         seed=42
     )
 
     codes_train = [enc.encode(img) for img in X_train]
 
     lay = Layout2D(
-        R_far=12, epochs_far=1,
-        R_near=3, epochs_near=1,
+        R_far=10, epochs_far=500,
+        R_near=3, epochs_near=0,
         seed=123
     )
 

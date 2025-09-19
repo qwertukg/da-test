@@ -27,6 +27,7 @@ class Layout2D:
         for dy in range(-R, R + 1):
             for dx in range(-R, R + 1):
                 if dy == 0 and dx == 0: continue
+                if math.hypot(dy, dx) > R: continue
                 ny, nx = y + dy, x + dx
                 if 0 <= ny < H and 0 <= nx < W: out.append((ny, nx))
         return out

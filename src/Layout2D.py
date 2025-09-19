@@ -4,11 +4,6 @@ from typing import List, Tuple, Dict, Set, Optional
 
 
 class Layout2D:
-    """
-    Два этапа:
-      - FAR (большой радиус): принимаем свап, если энергия ПОСЛЕ меньше (минимизация).
-      - NEAR (малый радиус): принимаем свап, если энергия ПОСЛЕ больше (максимизация).
-    """
 
     def __init__(self, R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123):
         self.R_far = R_far
@@ -63,7 +58,6 @@ class Layout2D:
         H, W = self._grid_shape(n);
         self.shape = (H, W)
 
-        # начальная укладка — построчно
         cells = [(y, x) for y in range(H) for x in range(W)]
         self.idx2cell = {};
         self._cell_owner = {yx: None for yx in cells}
@@ -89,13 +83,11 @@ class Layout2D:
                             self._local_energy(yxb, ia, R, sim_cache, override=override)
 
                     if phase == "far":
-                        # минимизация энергии
                         if e_swp + 1e-9 < e_cur:
                             self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
                             self._cell_owner[yxa], self._cell_owner[yxb] = ib, ia
                             if on_swap: on_swap(yxa, yxb, phase, ep, self)
-                    else:  # phase == "near"
-                        # максимизация энергии
+                    else:
                         if e_swp > e_cur + 1e-9:
                             self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
                             self._cell_owner[yxa], self._cell_owner[yxb] = ib, ia
@@ -103,8 +95,8 @@ class Layout2D:
 
                 if on_epoch: on_epoch(phase, ep, self)
 
-        pass_epoch(self.R_far, self.E_far, phase="far")  # FAR: минимизация
-        pass_epoch(self.R_near, self.E_near, phase="near")  # NEAR: максимизация
+        pass_epoch(self.R_far, self.E_far, phase="far")
+        pass_epoch(self.R_near, self.E_near, phase="near")
         return self
 
     def grid_shape(self) -> Tuple[int, int]:

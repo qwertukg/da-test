@@ -1,6 +1,5 @@
-import hashlib
 import random
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
@@ -11,39 +10,22 @@ class RandomKeyholeSamplingEncoder:
                  bits: int = 8192,
                  keyholes_per_img: int = 20,
                  keyhole_size: int = 5,
-                 orient_bins: int = 12,
                  bits_per_keyhole: int = 1,
-                 mag_thresh: float = 0.10,
-                 max_active_bits: Optional[int] = None,
-                 deterministic: bool = False,
                  seed: int = 42,
-                 unique_bits=True,
-                 centers_mode: str = "grid",
-                 grid_shape: Optional[Tuple[int, int]] = None):
+                 ):
 
         self.H, self.W = img_hw
         self.B = bits
         self.K = int(keyholes_per_img)
         self.S = int(keyhole_size)
         assert self.S % 2 == 1, "keyhole_size должно быть нечётным (например, 5)"
-        self.orient_bins = int(orient_bins)
         self.bits_per_keyhole = int(bits_per_keyhole)
-        self.mag_thresh = float(mag_thresh)
-        self.max_active_bits = max_active_bits if max_active_bits is None else int(max_active_bits)
-
-        self.deterministic = bool(deterministic)
-        self.centers_mode = centers_mode
-        self.grid_shape = grid_shape
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
 
-        self.unique_bits = unique_bits
         self.bit2info = {}
-        self._next_bit = 0
 
-        self._codebook: Dict[Tuple[int, int, int], List[int]] = {}
-        self._used_bits: Set[int] = set()
-        self.bit2yxb: Dict[int, Tuple[int, int, int]] = {}
+        self._codebook: Dict[Tuple[int, int, float], List[int]] = {}
 
     def encode(self, img: np.ndarray) -> Set[int]:
 
@@ -58,75 +40,24 @@ class RandomKeyholeSamplingEncoder:
         mmax = float(np.max(mag))
         mnorm = mag / (mmax + 1e-8) if mmax > 1e-8 else mag
 
-        centers = self._pick_keyholes(img)
+        centers = self._pick_keyholes()
         active: Set[int] = set()
-        kept_any = False
 
         for (cy, cx) in centers:
             y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
             tile_m = mnorm[y0:y1, x0:x1]
             tile_a = ang[y0:y1, x0:x1]
 
-            if float(np.mean(tile_m)) < self.mag_thresh:
-                continue
+            angle = self._dominant_angle(tile_a, tile_m)
 
-            bidx = np.floor((tile_a / (2 * np.pi)) * self.orient_bins).astype(int) % self.orient_bins
-
-            hist = np.zeros(self.orient_bins, dtype=np.float32)
-            for b in range(self.orient_bins):
-                hist[b] = float(tile_m[bidx == b].sum())
-            b_max = int(np.argmax(hist))
-
-            for bit in self._bits_for(cy, cx, b_max):
+            for bit in self._bits_for(cy, cx, angle):
                 active.add(bit)
-
-            kept_any = True
-
-        if not kept_any and centers:
-            strengths = []
-            for (cy, cx) in centers:
-                y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
-                strengths.append((float(np.mean(mnorm[y0:y1, x0:x1])), (cy, cx)))
-            strengths.sort(reverse=True)
-            (cy, cx) = strengths[0][1]
-            y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
-            tile_m = mnorm[y0:y1, x0:x1]
-            tile_a = ang[y0:y1, x0:x1]
-            bidx = np.floor((tile_a / (2 * np.pi)) * self.orient_bins).astype(int) % self.orient_bins
-            hist = np.zeros(self.orient_bins, dtype=np.float32)
-            for b in range(self.orient_bins):
-                hist[b] = float(tile_m[bidx == b].sum())
-            b_max = int(np.argmax(hist))
-            for bit in self._bits_for(cy, cx, b_max):
-                active.add(bit)
-
-        if self.max_active_bits is not None and len(active) > self.max_active_bits:
-            active = set(sorted(active)[: self.max_active_bits])
 
         return active
 
-    def _pick_keyholes(self, img: np.ndarray) -> List[Tuple[int, int]]:
+    def _pick_keyholes(self) -> List[Tuple[int, int]]:
 
         pad = self.S // 2
-
-        if self.centers_mode == "grid":
-
-            if self.grid_shape is None:
-
-                side = int(round(np.sqrt(self.K)))
-                gh, gw = max(1, side), max(1, side)
-            else:
-                gh, gw = self.grid_shape
-                gh = max(1, int(gh));
-                gw = max(1, int(gw))
-
-            ys = np.linspace(pad, self.H - 1 - pad, gh).round().astype(int)
-            xs = np.linspace(pad, self.W - 1 - pad, gw).round().astype(int)
-            centers = [(int(y), int(x)) for y in ys for x in xs]
-
-            if len(centers) > self.K:
-                centers = centers[: self.K]
-            return centers
 
         ys = list(range(pad, self.H - pad))
         xs = list(range(pad, self.W - pad))
@@ -134,15 +65,8 @@ class RandomKeyholeSamplingEncoder:
         if not all_centers:
             return []
 
-        if self.deterministic:
-            h = hashlib.sha256(img.astype(np.float32).tobytes()).digest()
-            seed_img = int.from_bytes(h[:8], "little") ^ self.seed
-            rng = random.Random(seed_img)
-        else:
-            rng = self.rng
-
         k = min(self.K, len(all_centers))
-        return rng.sample(all_centers, k)
+        return self.rng.sample(all_centers, k)
 
     def _window_bounds(self, cy: int, cx: int, H: int, W: int) -> Tuple[int, int, int, int]:
         r = self.S // 2
@@ -152,23 +76,12 @@ class RandomKeyholeSamplingEncoder:
         x1 = min(W, cx + r + 1)
         return y0, y1, x0, x1
 
-    def _bits_for(self, y: int, x: int, b: int) -> List[int]:
-        key = (int(y), int(x), int(b))
+    def _bits_for(self, y: int, x: int, angle: float) -> List[int]:
+        key = (int(y), int(x), float(angle))
         if key not in self._codebook:
-            if self.unique_bits:
-                ids = []
-                for _ in range(self.bits_per_keyhole):
-                    if self._next_bit >= self.B:
-                        break
-                    bit = self._next_bit
-                    self._next_bit += 1
-                    ids.append(bit)
-                    self.bit2info[bit] = {"y": int(y), "x": int(x), "bin": int(b)}
-                self._codebook[key] = ids
-            else:
-                self._codebook[key] = self._rand_bits(self.bits_per_keyhole)
-                for bit in self._codebook[key]:
-                    self.bit2info.setdefault(bit, {"y": int(y), "x": int(x), "bin": int(b)})
+            self._codebook[key] = self._rand_bits(self.bits_per_keyhole)
+            for bit in self._codebook[key]:
+                self.bit2info.setdefault(bit, {"y": int(y), "x": int(x), "angle": float(angle)})
         return self._codebook[key]
 
     def code_dominant_orientation(self, code: set[int]) -> tuple[float, float]:
@@ -176,38 +89,21 @@ class RandomKeyholeSamplingEncoder:
         if not code:
             return 0.0, 0.0
 
-        hist = np.zeros(self.orient_bins, dtype=np.float32)
+        angles: List[float] = []
         for bit in code:
             info = self.bit2info.get(int(bit))
             if info is None:
                 continue
-            hist[info["bin"]] += 1.0
-        if hist.sum() <= 0:
+            angles.append(float(info.get("angle", 0.0)))
+
+        if not angles:
             return 0.0, 0.0
-        b_max = int(hist.argmax())
 
-        angle = (b_max + 0.5) * (np.pi / self.orient_bins)
-        selectivity = float(hist[b_max] / (hist.sum() + 1e-9))
+        vectors = np.exp(1j * np.array(angles, dtype=np.float64))
+        vec_sum = vectors.sum()
+        angle = float(np.angle(vec_sum) % (2 * np.pi))
+        selectivity = float(abs(vec_sum) / len(vectors))
         return angle, selectivity
-
-    def _alloc_unique_bits(self, k: int) -> List[int]:
-
-        out: List[int] = []
-        tries = 0
-        while len(out) < k:
-            tries += 1
-
-            if tries > 10000 and (self.B - len(self._used_bits)) < (k - len(out)):
-                raise RuntimeError(
-                    "Недостаточно свободных битов при unique_bits=True: "
-                    f"нужно ещё {k - len(out)}, свободно {self.B - len(self._used_bits)}."
-                )
-            cand = self.rng.randrange(self.B)
-            if cand in self._used_bits:
-                continue
-            self._used_bits.add(cand)
-            out.append(cand)
-        return out
 
     def _rand_bits(self, k: int) -> List[int]:
 
@@ -237,16 +133,15 @@ class RandomKeyholeSamplingEncoder:
                 out[y, x] = float(np.sum(patch * k))
         return out
 
-    def get_keyhole_centers_grid(self) -> List[Tuple[int, int]]:
-        pad = self.S // 2
-        if self.grid_shape is None:
-            side = int(round(np.sqrt(self.K)))
-            gh, gw = max(1, side), max(1, side)
-        else:
-            gh, gw = self.grid_shape
-            gh = max(1, int(gh));
-            gw = max(1, int(gw))
-        ys = np.linspace(pad, self.H - 1 - pad, gh).round().astype(int)
-        xs = np.linspace(pad, self.W - 1 - pad, gw).round().astype(int)
-        centers = [(int(y), int(x)) for y in ys for x in xs]
-        return centers[: self.K]
+    @staticmethod
+    def _dominant_angle(tile_a: np.ndarray, tile_m: np.ndarray) -> float:
+        weights = tile_m.astype(np.float64)
+        total = float(weights.sum())
+        if total <= 1e-8:
+            return 0.0
+        vectors = np.exp(1j * tile_a.astype(np.float64)) * weights
+        vec_sum = vectors.sum()
+        if vec_sum == 0:
+            return 0.0
+        angle = float(np.angle(vec_sum) % (2 * np.pi))
+        return angle

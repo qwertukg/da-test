@@ -90,14 +90,7 @@ def run() -> None:
         bits=256,
         keyholes_per_img=25,
         keyhole_size=9,
-        orient_bins=6,
         bits_per_keyhole=12,
-        mag_thresh=0.30,
-        max_active_bits=None,
-        deterministic=False,
-        centers_mode="grid",
-        unique_bits=False,
-        grid_shape=(5, 5),
         seed=42
     )
 

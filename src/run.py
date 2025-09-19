@@ -8,14 +8,14 @@ from rerun.datatypes import AnnotationInfo
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
-from src.Layout2D import Layout2D
-from src.RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
+from Layout2D import Layout2D
+from RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
 
 
-def load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0):
+def load_mnist_28x28(train_limit=1000, test_limit=200, seed=0):
     tfm = transforms.ToTensor()
-    train_ds = MNIST(root="./data", train=True, download=True, transform=tfm)
-    test_ds = MNIST(root="./data", train=False, download=True, transform=tfm)
+    train_ds = MNIST(root="../data", train=True, download=True, transform=tfm)
+    test_ds = MNIST(root="../data", train=False, download=True, transform=tfm)
 
     rng = np.random.default_rng(seed)
     train_idx = np.arange(len(train_ds))
@@ -64,7 +64,7 @@ def rr_log_layout_bits(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", 
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
 
 
-def rr_log_layout_col(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
+def rr_log_layout_ang(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
     N = len(codes)
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
@@ -81,35 +81,38 @@ def run() -> None:
     rr_init("rkse+layout", spawn=True)
 
     def on_epoch_dots(phase, ep, lay):
-        rr_log_layout_bits(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
+        rr_log_layout_ang(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
 
-    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0)
+    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=100, test_limit=20, seed=0)
 
     enc = RandomKeyholeSamplingEncoder(
         img_hw=(28, 28),
-        bits=256,
-        keyholes_per_img=25,
-        keyhole_size=9,
-        orient_bins=6,
-        bits_per_keyhole=12,
-        mag_thresh=0.30,
-        max_active_bits=None,
-        deterministic=False,
-        centers_mode="grid",
-        unique_bits=False,
-        grid_shape=(5, 5),
-        seed=42
+        bits=64,
+        keyholes_per_img=20,
+        keyhole_size=5,
+        seed=42,
+        angle_layers=[(256, np.pi / 64), (128, np.pi / 96), (64, np.pi / 128)],
+        max_detectors_per_center=1,
+        bits_per_detector=2,
+        mag_eps=0.05,
+        min_active_frac=0.08,
+        adaptive_fill=True, adaptive_decay=0.5,
+        print_code=True, print_angle=True,
     )
 
     codes_train = [enc.encode(img) for img in X_train]
 
+    enc.print_density_and_overlap(codes_train)
+
     lay = Layout2D(
-        R_far=12, epochs_far=1,
-        R_near=3, epochs_near=1,
+        R_far=16, epochs_far=500,
+        R_near=3, epochs_near=0,
         seed=123
     )
 
     lay.fit(codes_train, on_epoch=on_epoch_dots)
+
+
 
     print("RKS layout complete!")
 

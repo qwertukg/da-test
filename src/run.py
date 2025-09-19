@@ -1,5 +1,5 @@
 import hashlib
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Optional
 
 import numpy as np
 import rerun as rr
@@ -62,14 +62,26 @@ def rgb_from_angle(angle_rad: float):
     r, g, b = (hsv_to_rgb([[h, 1.0, 1.0]])[0] * 255).astype(np.uint8)
     return int(r), int(g), int(b)
 
-def rr_log_layout_ang(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
+def rr_log_layout_ang(
+    lay: Layout2D,
+    codes: List[Set[int]],
+    enc,
+    tag: str = "layout",
+    step: int = 0,
+    angles: Optional[List[float]] = None,
+):
     N = len(codes)
+    if angles is not None and len(angles) != N:
+        raise ValueError("длина angles должна совпадать с числом кодов")
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
     for i, code in enumerate(codes):
         y, x = lay.position_of(i)
         pos[i] = (x, y)
-        angle, s = enc.code_dominant_orientation(code)
+        if angles is not None:
+            angle = angles[i]
+        else:
+            angle, _ = enc.code_dominant_orientation(code)
         col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
     rr.set_time("step", sequence=step)
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
@@ -81,7 +93,14 @@ def run() -> None:
     rr_init("rkse+layout", spawn=True)
 
     def on_epoch_dots(phase, ep, lay):
-        rr_log_layout_ang(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
+        rr_log_layout_ang(
+            lay,
+            keyhole_codes_train,
+            enc,
+            tag=f"layout/{phase}",
+            step=ep,
+            angles=keyhole_angles_train,
+        )
 
 
     X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=100, test_limit=20, seed=0)
@@ -104,8 +123,20 @@ def run() -> None:
         adaptive_fill=True, adaptive_decay=0.5,
     )
 
-    codes_train = [set().union(*codes) if codes else set()
-                   for codes in (enc.encode(img) for img in X_train)]
+    keyhole_codes_train: List[Set[int]] = []
+    keyhole_meta_train: List[Tuple[int, int, float]] = []
+
+    for img_idx, img in enumerate(X_train):
+        enc_codes = enc.encode(img)
+        if len(enc_codes) != len(enc.keyhole_records):
+            raise RuntimeError(
+                "encode() должен заполнять keyhole_records для каждой скважины"
+            )
+        for keyhole_idx, (angle, code) in enumerate(enc.keyhole_records):
+            keyhole_codes_train.append(code)
+            keyhole_meta_train.append((img_idx, keyhole_idx, angle))
+
+    keyhole_angles_train: List[float] = [meta[2] for meta in keyhole_meta_train]
 
     enc.print_keyhole_records(False)
 
@@ -115,7 +146,7 @@ def run() -> None:
         seed=123
     )
 
-    lay.fit(codes_train, on_epoch=on_epoch_dots)
+    lay.fit(keyhole_codes_train, on_epoch=on_epoch_dots)
 
 
 

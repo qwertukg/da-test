@@ -1,6 +1,8 @@
-import numpy as np
+import hashlib
 import random
 from typing import Dict, List, Set, Tuple, Optional
+
+import numpy as np
 
 
 class RandomKeyholeSamplingEncoder:
@@ -15,7 +17,7 @@ class RandomKeyholeSamplingEncoder:
                  max_active_bits: Optional[int] = None,
                  deterministic: bool = False,
                  seed: int = 42,
-                 unique_bits = True,
+                 unique_bits=True,
                  centers_mode: str = "grid",
                  grid_shape: Optional[Tuple[int, int]] = None):
 
@@ -29,7 +31,6 @@ class RandomKeyholeSamplingEncoder:
         self.mag_thresh = float(mag_thresh)
         self.max_active_bits = max_active_bits if max_active_bits is None else int(max_active_bits)
 
-
         self.deterministic = bool(deterministic)
         self.centers_mode = centers_mode
         self.grid_shape = grid_shape
@@ -40,12 +41,9 @@ class RandomKeyholeSamplingEncoder:
         self.bit2info = {}
         self._next_bit = 0
 
-
         self._codebook: Dict[Tuple[int, int, int], List[int]] = {}
         self._used_bits: Set[int] = set()
         self.bit2yxb: Dict[int, Tuple[int, int, int]] = {}
-
-
 
     def encode(self, img: np.ndarray) -> Set[int]:
 
@@ -56,7 +54,6 @@ class RandomKeyholeSamplingEncoder:
         gx, gy = self._sobel(img)
         mag = np.hypot(gx, gy)
         ang = (np.arctan2(gy, gx) + np.pi)
-
 
         mmax = float(np.max(mag))
         mnorm = mag / (mmax + 1e-8) if mmax > 1e-8 else mag
@@ -70,10 +67,8 @@ class RandomKeyholeSamplingEncoder:
             tile_m = mnorm[y0:y1, x0:x1]
             tile_a = ang[y0:y1, x0:x1]
 
-
             if float(np.mean(tile_m)) < self.mag_thresh:
                 continue
-
 
             bidx = np.floor((tile_a / (2 * np.pi)) * self.orient_bins).astype(int) % self.orient_bins
 
@@ -82,12 +77,10 @@ class RandomKeyholeSamplingEncoder:
                 hist[b] = float(tile_m[bidx == b].sum())
             b_max = int(np.argmax(hist))
 
-
             for bit in self._bits_for(cy, cx, b_max):
                 active.add(bit)
 
             kept_any = True
-
 
         if not kept_any and centers:
             strengths = []
@@ -107,12 +100,10 @@ class RandomKeyholeSamplingEncoder:
             for bit in self._bits_for(cy, cx, b_max):
                 active.add(bit)
 
-
         if self.max_active_bits is not None and len(active) > self.max_active_bits:
             active = set(sorted(active)[: self.max_active_bits])
 
         return active
-
 
     def _pick_keyholes(self, img: np.ndarray) -> List[Tuple[int, int]]:
 
@@ -126,7 +117,8 @@ class RandomKeyholeSamplingEncoder:
                 gh, gw = max(1, side), max(1, side)
             else:
                 gh, gw = self.grid_shape
-                gh = max(1, int(gh)); gw = max(1, int(gw))
+                gh = max(1, int(gh));
+                gw = max(1, int(gw))
 
             ys = np.linspace(pad, self.H - 1 - pad, gh).round().astype(int)
             xs = np.linspace(pad, self.W - 1 - pad, gw).round().astype(int)
@@ -136,7 +128,6 @@ class RandomKeyholeSamplingEncoder:
                 centers = centers[: self.K]
             return centers
 
-
         ys = list(range(pad, self.H - pad))
         xs = list(range(pad, self.W - pad))
         all_centers = [(y, x) for y in ys for x in xs]
@@ -144,8 +135,6 @@ class RandomKeyholeSamplingEncoder:
             return []
 
         if self.deterministic:
-
-            import hashlib
             h = hashlib.sha256(img.astype(np.float32).tobytes()).digest()
             seed_img = int.from_bytes(h[:8], "little") ^ self.seed
             rng = random.Random(seed_img)
@@ -162,7 +151,6 @@ class RandomKeyholeSamplingEncoder:
         x0 = max(0, cx - r)
         x1 = min(W, cx + r + 1)
         return y0, y1, x0, x1
-
 
     def _bits_for(self, y: int, x: int, b: int) -> List[int]:
         key = (int(y), int(x), int(b))
@@ -182,7 +170,6 @@ class RandomKeyholeSamplingEncoder:
                 for bit in self._codebook[key]:
                     self.bit2info.setdefault(bit, {"y": int(y), "x": int(x), "bin": int(b)})
         return self._codebook[key]
-
 
     def code_dominant_orientation(self, code: set[int]) -> tuple[float, float]:
 
@@ -233,9 +220,9 @@ class RandomKeyholeSamplingEncoder:
         kx = np.array([[-1, 0, 1],
                        [-2, 0, 2],
                        [-1, 0, 1]], dtype=np.float32)
-        ky = np.array([[ 1, 2, 1],
-                       [ 0, 0, 0],
-                       [-1,-2,-1]], dtype=np.float32)
+        ky = np.array([[1, 2, 1],
+                       [0, 0, 0],
+                       [-1, -2, -1]], dtype=np.float32)
         gx = RandomKeyholeSamplingEncoder._conv2_same(img01, kx)
         gy = RandomKeyholeSamplingEncoder._conv2_same(img01, ky)
         return gx, gy
@@ -262,7 +249,8 @@ class RandomKeyholeSamplingEncoder:
             gh, gw = max(1, side), max(1, side)
         else:
             gh, gw = self.grid_shape
-            gh = max(1, int(gh)); gw = max(1, int(gw))
+            gh = max(1, int(gh));
+            gw = max(1, int(gw))
         ys = np.linspace(pad, self.H - 1 - pad, gh).round().astype(int)
         xs = np.linspace(pad, self.W - 1 - pad, gw).round().astype(int)
         centers = [(int(y), int(x)) for y in ys for x in xs]

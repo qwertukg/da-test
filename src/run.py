@@ -1,11 +1,16 @@
-from src.Layout2D import Layout2D
-from src.RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
+import hashlib
+from typing import List, Tuple, Set
+
 import numpy as np
+import rerun as rr
+from matplotlib.colors import hsv_to_rgb
+from rerun.datatypes import AnnotationInfo
 from torchvision import transforms
 from torchvision.datasets import MNIST
-import rerun as rr
-import math, random, hashlib
-from typing import List, Tuple, Dict, Set, Optional
+
+from src.Layout2D import Layout2D
+from src.RandomKeyholeSamplingEncoder import RandomKeyholeSamplingEncoder
+
 
 def load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0):
     """Грузит и подсэмплирует MNIST (28×28, 0..1)."""
@@ -34,7 +39,6 @@ def rr_init(app_name: str = "digits-layout", spawn: bool = True, class_labels=No
     rr.init(app_name, spawn=spawn)
     if class_labels is not None:
         # class_labels: {id:int -> label:str}
-        from rerun.datatypes import AnnotationInfo
         ann = [AnnotationInfo(id=int(i), label=str(lbl)) for i, lbl in class_labels.items()]
         rr.log("layout", rr.AnnotationContext(ann), static=True)
 
@@ -45,7 +49,14 @@ def rgb_from_bits(bits: Set[int]) -> Tuple[int, int, int]:
     return (h[0], h[1], h[2])  # 0..255
 
 
-def rr_log_layout(lay: Layout2D, codes: List[Set[int]], tag="layout", step=0):
+# Цвет по углу (experimental)
+def rgb_from_angle(angle_rad: float):
+    h = (angle_rad / np.pi) % 1.0
+    r, g, b = (hsv_to_rgb([[h, 1.0, 1.0]])[0] * 255).astype(np.uint8)
+    return int(r), int(g), int(b)
+
+
+def rr_log_layout_bits(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
     N = len(codes)
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
@@ -57,7 +68,25 @@ def rr_log_layout(lay: Layout2D, codes: List[Set[int]], tag="layout", step=0):
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
 
 
-def main() -> None:
+def rr_log_layout_col(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
+    N = len(codes)
+    pos = np.zeros((N, 2), dtype=np.float32)
+    col = np.zeros((N, 3), dtype=np.uint8)
+    for i, code in enumerate(codes):
+        y, x = lay.position_of(i)
+        pos[i] = (x, y)
+        angle, sel = enc.code_dominant_orientation(code)  # доминирующий угол и селективность
+        col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
+    rr.set_time("step", sequence=step)
+    rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
+
+
+def run() -> None:
+    rr_init("rkse+layout", spawn=True)
+
+    def on_epoch_dots(phase, ep, lay):
+        rr_log_layout_bits(lay, codes_train, enc, tag=f"layout/{phase}", step=ep)
+
     X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=8000, test_limit=2000, seed=0)
 
     enc = RandomKeyholeSamplingEncoder(
@@ -77,22 +106,17 @@ def main() -> None:
     )
 
     codes_train = [enc.encode(img) for img in X_train]
-    codes_test  = [enc.encode(img) for img in X_test]
-
-    rr_init("rkse+layout", spawn=True)
-
-    def on_epoch_dots(phase, ep, lay):
-        rr_log_layout(lay, codes_train, tag=f"layout/{phase}", step=ep)
 
     lay = Layout2D(
         R_far=12, epochs_far=1,
         R_near=3, epochs_near=1,
         seed=123
     )
+
     lay.fit(codes_train, on_epoch=on_epoch_dots)
 
     print("RKS layout complete!")
 
 
 if __name__ == "__main__":
-    main()
+    run()

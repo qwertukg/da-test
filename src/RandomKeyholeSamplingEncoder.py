@@ -8,88 +8,31 @@ import numpy as np
 
 class RandomKeyholeSamplingEncoder:
     """
-    Эncодер «случайных скважин» с угловыми широкими детекторами (без квантизации угла).
-
-    Идея:
-      1) По всему изображению считаем градиенты Собеля (gx, gy) → модуль/угол.
-      2) Выбираем K центров-«скважин» (окна S×S), отсеивая «плоские» окна по метрике неплоскости.
-         При нехватке подходящих окон пороги ослабляются (опционально), чтобы добрать до K.
-      3) Для каждой скважины вычисляем доминирующий угол (взвешенный модулем).
-      4) Активируем биты через набор глобальных «широких детекторов» по углу (перекрывающиеся дуги).
-         Биты не зависят от координат (инвариантность к сдвигу).
-      5) Итоговый код — объединение битов по всем скважинам.
-
-    Примечание:
-      Координаты (y, x) влияют только на выбор патча и отсев «плоских» окон;
-      позиция в сам код не зашита. Это увеличивает перекрытие между похожими углами
-      в разных местах и разных изображениях.
+    Энкодер «случайных скважин» с широкими угловыми детекторами.
+    1 скважина -> 1 код (множество битов). Коды зависят ТОЛЬКО от угла в скважине.
     """
 
     def __init__(self,
                  img_hw: Tuple[int, int] = (28, 28),
-                 bits: int = 256,
+                 bits: int = 128,
                  keyholes_per_img: int = 20,
                  keyhole_size: int = 5,
                  seed: int = 42,
-                 # ---- Детекторы по углу (настройка похожести) ----
+                 # --- угловые слои: (число детекторов, полуширина дуги) ---
                  angle_layers: Optional[List[Tuple[int, float]]] = None,
-                 bits_per_detector: int = 8,
-                 max_detectors_per_center: int = 3,
-                 # ---- Отсев «плоских» окон и добор до K ----
+                 # --- сколько ближайших детекторов брать на каждом слое ---
+                 detectors_per_layer: Optional[List[int]] = None,
+                 # --- сколько бит выдает один детектор ---
+                 bits_per_detector: int = 4,
+                 # --- отбор «неплоских» скважин ---
                  mag_eps: float = 0.03,
                  min_active_frac: float = 0.05,
                  adaptive_fill: bool = True,
                  adaptive_decay: float = 0.5,
-                 # ---- Поведение печати ----
-                 print_code: bool = False,
-                 print_angle: bool = False,
+                 # --- символы для штрихкода (используются в print_keyhole_records) ---
                  barcode_on: str = "|",
                  barcode_off: str = " ",
                  ):
-        """
-        Параметры
-        ----------
-        img_hw : (H, W)
-            Ожидаемый размер входного изображения (серое, 2D).
-        bits : int
-            Размерность бинарного кода (длина вектора/число бит).
-        keyholes_per_img : int
-            Число скважин (окон) на изображение, которые будут учитываться.
-        keyhole_size : int (нечётный)
-            Размер стороны окна S×S для каждой скважины.
-        seed : int
-            Сид для детерминированного хэш-мэппинга детекторов в биты и RNG.
-
-        angle_layers : список (N, width)
-            Конфигурация «широких детекторов» по углу:
-            - N   : число детекторов, равномерно распределённых по окружности [0, 2π)
-            - width: полуширина дуги для бинарной активации (в радианах)
-            Бóльшие width дают «дальний порядок» (большее типовое перекрытие),
-            меньшие — «ближний порядок» (более острое различение углов).
-        bits_per_detector : int
-            Сколько бит выдаёт один детектор (для снижения коллизий и вариативности).
-        max_detectors_per_center : int
-            Сколько детекторов максимум может сработать на одну скважину
-            (выбираются по приоритету: ближе к центру дуги — выше).
-
-        mag_eps : float
-            Порог пиксельной магнитуды (в нормировке [0..1]) для признака «не ноль».
-        min_active_frac : float
-            Минимальная доля пикселей в окне с магнитудой > mag_eps, чтобы окно не считалось «плоским».
-        adaptive_fill : bool
-            Если True — пороги `mag_eps` и `min_active_frac` будут понижаться (×adaptive_decay),
-            чтобы добрать до K окон.
-        adaptive_decay : float
-            Множитель ослабления порогов (0 < adaptive_decay < 1).
-
-        print_code : bool
-            Печатать ли «штрихкод» результата ('|' и пробелы).
-        print_angle : bool
-            Печатать ли средний (по кругу) угол Собеля по выбранным скважинам.
-        barcode_on / barcode_off : str
-            Символы для «1» и «0» в строке-штрихкоде.
-        """
-        # --- базовые параметры ---
         self.H, self.W = img_hw
         self.B = int(bits)
         self.K = int(keyholes_per_img)
@@ -98,127 +41,142 @@ class RandomKeyholeSamplingEncoder:
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
 
-        # --- детекторы по углу ---
+        # слои по углу (узкий + широкий по умолчанию)
         if angle_layers is None:
             angle_layers = [
-                (64, float(np.pi / 16)),  # высокая «разборчивость»
-                (32, float(np.pi / 8)),   # средняя
-                (16, float(np.pi / 4)),   # сглаживание (дальний порядок)
-                (8,  float(np.pi / 2)),   # широкий слой
-                (4,  float(3 * np.pi / 4))
+                (128, float(np.pi / 64)),  # узкий (детализация)
+                (16,  float(np.pi / 3)),   # широкий (стабильность/перекрытие)
             ]
-        self.angle_layers: List[Tuple[int, float]] = [
-            (int(n), float(width)) for (n, width) in angle_layers
-        ]
-        self.bits_per_detector = int(bits_per_detector)
-        self.max_detectors_per_center = int(max_detectors_per_center)
+        self.angle_layers: List[Tuple[int, float]] = [(int(n), float(w)) for (n, w) in angle_layers]
 
-        # --- пороги неплоскости и добор ---
+        if detectors_per_layer is None:
+            detectors_per_layer = [1] * len(self.angle_layers)
+        assert len(detectors_per_layer) == len(self.angle_layers)
+        self.detectors_per_layer: List[int] = [max(1, int(k)) for k in detectors_per_layer]
+
+        self.bits_per_detector = int(bits_per_detector)
+
+        # отбор «неплоских»
         self.mag_eps = float(mag_eps)
         self.min_active_frac = float(min_active_frac)
         self.adaptive_fill = bool(adaptive_fill)
         self.adaptive_decay = float(adaptive_decay)
         assert 0.0 < self.adaptive_decay <= 1.0, "adaptive_decay должен быть в (0, 1]"
 
-        # --- печать ---
-        self.print_code = bool(print_code)
-        self.print_angle = bool(print_angle)
+        # отображение штрихкода
         self.barcode_on = str(barcode_on)
         self.barcode_off = str(barcode_off)
 
-        # --- внутренние структуры ---
-        self._angle_detectors: List[Tuple[float, float, List[int]]] = []
-        self._build_angle_detectors()
+        # слои детекторов (центры и закреплённые за ними биты)
+        self._layers: List[Dict[str, object]] = []
+        self._build_angle_layers()
+
+        # отладочная инфа по битам (угол)
         self.bit2info: Dict[int, Dict[str, float]] = {}
 
-    # ==================== ПАБЛИК API ====================
+        # --- НОВОЕ: сюда пишем по каждой скважине (angle, code) ---
+        # После каждого encode() список перезаписывается заново.
+        self.keyhole_records: List[Tuple[float, Set[int]]] = []
 
-    def encode(self, img: np.ndarray) -> Set[int]:
+    # ==================== ПУБЛИЧНОЕ API ====================
+
+    def encode(self, img: np.ndarray) -> List[Set[int]]:
         """
-        Закодировать изображение в множество активных битов.
-
-        Параметры
-        ----------
-        img : np.ndarray shape (H, W), dtype float/uint8...
-            Одноканальное изображение ожидаемого размера `img_hw`.
-            Если значения не нормированы, это не критично — внутри Собель и
-            нормировка магнитуды выполнены автоматически.
-
-        Возврат
-        -------
-        active : Set[int]
-            Множество индексов активных битов (0 <= bit < bits).
+        Кодирует изображение в СПИСОК кодов скважин (1 скважина -> 1 код).
+        Также заполняет self.keyhole_records списком (angle, code).
         """
         H, W = img.shape
         if (H, W) != (self.H, self.W):
             raise ValueError(f"Ожидался размер {(self.H, self.W)}, а пришёл {(H, W)}")
 
-        # 1) Градиенты Собеля, модуль/угол
+        # сбрасываем записи прошлых вызовов
+        self.keyhole_records = []
+
+        # 1) Собель
         gx, gy = self._sobel(img)
         mag = np.hypot(gx, gy)
         ang = (np.arctan2(gy, gx) + np.pi)  # [0, 2π)
 
-        # Нормировка магнитуды для порогов неплоскости
+        # 2) Нормировка магнитуды для отбора неплоских
         mmax = float(np.max(mag))
         mnorm = mag / (mmax + 1e-8) if mmax > 1e-8 else mag
 
-        # 2) Выбор K неплоских центров (с адаптивным добором при нехватке)
+        # 3) Выбор центров
         centers = self._pick_keyholes(mnorm)
 
-        # 3) Активация детекторов по углу
-        active: Set[int] = set()
-        angles_accum: List[float] = []
+        # 4) По скважине — код (только от угла)
+        codes_per_keyhole: List[Set[int]] = []
         for (cy, cx) in centers:
             y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
             tile_m = mnorm[y0:y1, x0:x1]
             tile_a = ang[y0:y1, x0:x1]
 
-            angle = self._dominant_angle(tile_a, tile_m)
-            angles_accum.append(float(angle))
+            angle = self._dominant_angle(tile_a, tile_m)  # [0, 2π)
+            bits_set: Set[int] = set(self._angle_bits_per_layer(angle))
 
-            for bit in self._angle_bits(angle):
-                active.add(bit)
-                # для отладки/аналитики:
-                self.bit2info.setdefault(bit, {"angle": float(angle)})
+            for bit in bits_set:
+                self.bit2info.setdefault(int(bit), {"angle": float(angle)})
 
-        # 4) Диагностика (по желанию)
-        if self.print_code or self.print_angle:
-            sobel_angle = self._circular_mean(angles_accum) if angles_accum else None
-            self._print_barcode_and_angle(active, sobel_angle)
+            # --- НОВОЕ: накапливаем в поле класса ---
+            self.keyhole_records.append((float(angle), bits_set))
 
-        return active
+            codes_per_keyhole.append(bits_set)
 
-    def print_density_and_overlap(self, codes: List[Set[int]]) -> Tuple[float, float]:
+        return codes_per_keyhole
+
+    def print_keyhole_records(self, as_barcode: bool = True) -> None:
         """
-        Печать и возврат метрик качества кодов по батчу.
-
-        avg_density  = средняя плотность = mean_i ( |code_i| / B )
-        avg_overlap  = средний Яккард по всем парам:
-                       J(A,B) = |A ∩ B| / |A ∪ B|
-                       (для двух пустых кодов принимаем J=1.0)
-
-        Параметры
-        ----------
-        codes : список множеств битов для разных изображений.
-
-        Возврат
-        -------
-        (avg_density, avg_overlap) : Tuple[float, float]
+        Печатает список (angle, code) по возрастанию угла.
+        as_barcode=True: выводит штрихкоды длиной B; иначе — индексы активных битов.
         """
-        n = len(codes)
+        if not self.keyhole_records:
+            print("Записей нет. Сначала вызовите encode().")
+            return
+
+        # сортировка по возрастанию угла
+        recs = sorted(self.keyhole_records, key=lambda t: t[0])
+
+        for ang, code in recs:
+            deg = ang * 180.0 / np.pi
+            if as_barcode:
+                s = self._bits_to_barcode(code)
+            else:
+                inds = sorted(int(b) for b in code)
+                s = f"indices={inds}"
+            print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
+
+    def average_density(self, codes_per_keyhole: List[Set[int]]) -> float:
+        """
+        Средняя плотность по скважинам: mean_k(|code_k| / B).
+        """
+        if not codes_per_keyhole:
+            print("avg_density (per keyhole) = 0.000000")
+            return 0.0
+        densities = [len(c) / float(self.B) for c in codes_per_keyhole]
+        avg_density = float(sum(densities) / len(densities))
+        print(f"avg_density (per keyhole) = {avg_density:.6f}")
+        return avg_density
+
+    def print_density_and_overlap(self, codes_per_keyhole: List[Set[int]]) -> Tuple[float, float]:
+        """
+        Метрики ПО СКВАЖИНАМ (для одного изображения).
+        avg_density = mean_k( |code_k| / B )
+        avg_overlap = средний Яккард по всем парам скважин (J=1.0 для двух пустых).
+        """
+        n = len(codes_per_keyhole)
         if n == 0:
-            print("avg_density=0.0, avg_overlap=0.0 (нет кодов)")
+            print("avg_density=0.0, avg_overlap=0.0 (скважин нет)")
             return 0.0, 0.0
 
-        densities = [len(c) / float(self.B) for c in codes]
+        densities = [len(c) / float(self.B) for c in codes_per_keyhole]
         avg_density = float(sum(densities) / n)
 
         pair_sum = 0.0
         pair_cnt = 0
         for i in range(n):
-            A = codes[i]
+            A = codes_per_keyhole[i]
             for j in range(i + 1, n):
-                B = codes[j]
+                B = codes_per_keyhole[j]
                 if not A and not B:
                     jacc = 1.0
                 else:
@@ -228,33 +186,18 @@ class RandomKeyholeSamplingEncoder:
                 pair_cnt += 1
 
         avg_overlap = (pair_sum / pair_cnt) if pair_cnt > 0 else 0.0
-
-        print(f"avg_density = {avg_density:.6f}")
-        print(f"avg_overlap (Jaccard) = {avg_overlap:.6f}")
+        print(f"avg_density (per keyhole) = {avg_density:.6f}")
+        print(f"avg_overlap (Jaccard, between keyholes) = {avg_overlap:.6f}")
         return avg_density, avg_overlap
 
-    # ==================== ВНУТРЕННИЕ МЕТОДЫ ====================
+    # ==================== ВНУТРЕННЕЕ ====================
 
     def _pick_keyholes(self, mnorm: np.ndarray) -> List[Tuple[int, int]]:
-        """
-        Выбор центров скважин среди всех допустимых координат
-        с отсевом «плоских» и адаптивным добором до K.
-
-        Кандидат (окно) описывается:
-          mean = средняя нормированная магнитуда в окне
-          frac = доля пикселей с m > mag_eps
-          score = 0.5*mean + 0.5*frac (сортировка по убыванию)
-
-        Порог неплоскости:
-          frac >= min_active_frac и mean >= mag_eps
-
-        Если выбранных < K и adaptive_fill=True — пороги умножаются на adaptive_decay
-        и отбор повторяется, пока не наберём K или пороги не обнулятся.
-        """
+        """Отбираем до K центров по неплоскости; при нехватке — ослабляем пороги."""
         H, W = mnorm.shape
         pad = self.S // 2
 
-        candidates: List[Tuple[float, float, float, int, int]] = []  # (score, frac, mean, y, x)
+        candidates: List[Tuple[float, float, float, int, int]] = []
         for y in range(pad, H - pad):
             for x in range(pad, W - pad):
                 y0, y1, x0, x1 = self._window_bounds(y, x, H, W)
@@ -280,20 +223,12 @@ class RandomKeyholeSamplingEncoder:
             if len(picked) >= self.K or not self.adaptive_fill:
                 return picked[: self.K]
 
-            # ослабляем пороги и повторяем
             thr_frac *= self.adaptive_decay
             thr_mean *= self.adaptive_decay
             if thr_frac <= 0.0 and thr_mean <= 0.0:
-                return picked  # на полностью гладком изображении может быть < K
+                return picked
 
-    @staticmethod
-    def _window_bounds(cy: int, cx: int, H: int, W: int) -> Tuple[int, int, int, int]:
-        """Координаты окна S×S вокруг (cy, cx) внутри границ изображения."""
-        # r = S//2 вычислим через отношение к self; здесь статик — ради скорости в цикле
-        # но границу по S контролируем снаружи
-        raise NotImplementedError  # см. реализацию ниже (не статик)
-
-    def _window_bounds(self, cy: int, cx: int, H: int, W: int) -> Tuple[int, int, int, int]:  # type: ignore[override]
+    def _window_bounds(self, cy: int, cx: int, H: int, W: int) -> Tuple[int, int, int, int]:
         r = self.S // 2
         y0 = max(0, cy - r); y1 = min(H, cy + r + 1)
         x0 = max(0, cx - r); x1 = min(W, cx + r + 1)
@@ -301,7 +236,6 @@ class RandomKeyholeSamplingEncoder:
 
     @staticmethod
     def _sobel(img01: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Собель 3×3 по X/Y с паддингом по краю."""
         kx = np.array([[-1, 0, 1],
                        [-2, 0, 2],
                        [-1, 0, 1]], dtype=np.float32)
@@ -314,7 +248,6 @@ class RandomKeyholeSamplingEncoder:
 
     @staticmethod
     def _conv2_same(img: np.ndarray, k: np.ndarray) -> np.ndarray:
-        """Свертка ядром k с сохранением размера (edge padding)."""
         ph, pw = k.shape[0] // 2, k.shape[1] // 2
         pad = np.pad(img, ((ph, ph), (pw, pw)), mode='edge')
         H, W = img.shape
@@ -328,31 +261,27 @@ class RandomKeyholeSamplingEncoder:
 
     @staticmethod
     def _dominant_angle(tile_a: np.ndarray, tile_m: np.ndarray) -> float:
-        """
-        Доминирующий угол в окне: аргумент векторной суммы единичных векторов
-        направлений пикселей, взвешенных магнитудой.
-        Возвращает угол в [0, 2π). При «плоском» окне вернёт 0.0.
-        """
+        """Доминирующий угол на окне (в радианах, [0, 2π))."""
         weights = tile_m.astype(np.float64)
         total = float(weights.sum())
         if total <= 1e-8:
             return 0.0
-        vectors = np.exp(1j * tile_a.astype(np.float64)) * weights
-        vec_sum = vectors.sum()
+        vec_sum = (np.exp(1j * tile_a.astype(np.float64)) * weights).sum()
         if vec_sum == 0:
             return 0.0
         return float(np.angle(vec_sum) % (2 * np.pi))
 
-    # --------- Широкие детекторы по углу ---------
-
-    def _build_angle_detectors(self) -> None:
-        """Создаёт список детекторов: (центр дуги mu, полуширина width, закреплённые биты)."""
-        self._angle_detectors.clear()
+    # ---- многослойные детекторы по углу ----
+    def _build_angle_layers(self) -> None:
+        """Создаёт слои детекторов: для каждого центра фиксируем свой список битов."""
+        self._layers.clear()
         for L, (n, width) in enumerate(self.angle_layers):
-            for j in range(n):
-                mu = 2.0 * np.pi * float(j) / float(n)  # равномерно по окружности
-                bits = self._det_bits(f"ANG_DET:{L}:{j}:{self.seed}", self.bits_per_detector)
-                self._angle_detectors.append((float(mu), float(width), bits))
+            n = int(n)
+            width = float(width)
+            mus = [2.0 * np.pi * j / n for j in range(n)]
+            bits_tbl = [self._det_bits(f"L{L}:DET{j}:{self.seed}", self.bits_per_detector)
+                        for j in range(n)]
+            self._layers.append({"n": n, "width": width, "mu": mus, "bits": bits_tbl})
 
     @staticmethod
     def _circ_delta(a: float, b: float) -> float:
@@ -360,71 +289,55 @@ class RandomKeyholeSamplingEncoder:
         return abs((a - b + np.pi) % (2.0 * np.pi) - np.pi)
 
     def _det_bits(self, key: str, k: int) -> List[int]:
-        """Детерминированное отображение «детектор → k битов» (устойчиво между запусками)."""
+        """Детерминированное отображение «детектор -> k битов»."""
         h = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=16).digest(), 'little')
-        step = 0x9E3779B97F4A7C15  # псевдо-золотое смещение
+        step = 0x9E3779B97F4A7C15
         return [int((h + i * step) % self.B) for i in range(k)]
 
-    def _angle_bits(self, angle: float) -> List[int]:
+    def _angle_bits_per_layer(self, angle: float) -> List[int]:
         """
-        Вернуть биты детекторов, активных для данного угла.
-
-        Логика:
-          1) Бинарная активация детекторов, где |angle - mu|_circle <= width.
-             Приоритезируем более «центральные» детекторы (больше width - d).
-          2) Если ничего не попало — выбираем ближайшие по «гауссовой» близости.
-          3) Обрезаем до max_detectors_per_center.
+        Для данного угла собираем биты с каждого слоя:
+        берём k_L детекторов с лучшим приоритетом (внутри дуги — приоритет по близости к центру,
+        если никого нет — k_L ближайших по круговой дистанции).
         """
-        candidates: List[Tuple[float, List[int]]] = []
-        for (mu, width, bits) in self._angle_detectors:
-            d = self._circ_delta(angle, mu)
-            if d <= width:
-                candidates.append((float(width - d), bits))
+        out: List[int] = []
+        for L, layer in enumerate(self._layers):
+            n = layer["n"]            # type: ignore[assignment]
+            width = layer["width"]    # type: ignore[assignment]
+            mus = layer["mu"]         # type: ignore[assignment]
+            bits_tbl = layer["bits"]  # type: ignore[assignment]
+            kL = min(self.detectors_per_layer[L], n)
 
-        if not candidates:
-            tmp: List[Tuple[float, List[int]]] = []
-            for (mu, width, bits) in self._angle_detectors:
-                d = self._circ_delta(angle, mu)
-                s = float(math.exp(-0.5 * (d / (width + 1e-9)) ** 2))
-                tmp.append((s, bits))
-            tmp.sort(key=lambda t: t[0], reverse=True)
-            candidates = tmp[: self.max_detectors_per_center]
-        else:
-            candidates.sort(key=lambda t: t[0], reverse=True)
-            candidates = candidates[: self.max_detectors_per_center]
+            cand: List[Tuple[float, int]] = []
+            for j in range(n):  # type: ignore[arg-type]
+                d = self._circ_delta(angle, mus[j])  # type: ignore[index]
+                if d <= width:
+                    cand.append((width - d, j))
 
-        ids: List[int] = []
-        for _, bits in candidates:
-            ids.extend(bits)
-        return ids
-
-    # --------- Вспомогательные ---------
-
-    @staticmethod
-    def _circular_mean(angles: List[float]) -> Optional[float]:
-        """Круговое среднее углов в [0, 2π). Возвращает None, если список пуст."""
-        if not angles:
-            return None
-        v = np.exp(1j * np.array(angles, dtype=np.float64))
-        vec_sum = v.sum()
-        return float(np.angle(vec_sum) % (2 * np.pi))
-
-    def _print_barcode_and_angle(self, active: Set[int], mean_angle: Optional[float]) -> None:
-        """Печатает строку-«штрихкод» и средний угол (если запрошено флагами)."""
-        if self.print_code:
-            bar = [self.barcode_off] * self.B
-            for b in active:
-                bi = int(b)
-                if 0 <= bi < self.B:
-                    bar[bi] = self.barcode_on
-            print(''.join(bar))
-        if self.print_angle:
-            if mean_angle is None:
-                print("sobel_angle ≈ n/a")
+            if not cand:
+                dist = [(self._circ_delta(angle, mus[j]), j) for j in range(n)]  # type: ignore[index]
+                dist.sort(key=lambda t: t[0])
+                chosen = [j for _, j in dist[:kL]]
             else:
-                print(f"sobel_angle ≈ {mean_angle:.6f} rad ({mean_angle * 180 / np.pi:.2f}°)")
+                cand.sort(key=lambda t: t[0], reverse=True)
+                chosen = [j for _, j in cand[:kL]]
 
-    def code_dominant_orientation(self, code: set[int]) -> tuple[float, float]:
+            for j in chosen:
+                out.extend(bits_tbl[j])  # type: ignore[index]
+
+        return out
+
+    # ---- служебное: формирование штрихкода из множества битов ----
+    def _bits_to_barcode(self, code: Set[int]) -> str:
+        bar = [self.barcode_off] * self.B
+        for b in code:
+            bi = int(b)
+            if 0 <= bi < self.B:
+                bar[bi] = self.barcode_on
+        return ''.join(bar)
+
+    # (опционально) восстановление кругового среднего угла из объединённого кода
+    def code_dominant_orientation(self, code: Set[int]) -> Tuple[float, float]:
         if not code:
             return (0.0, 0.0)
         angles: List[float] = []

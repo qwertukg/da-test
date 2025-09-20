@@ -1,6 +1,6 @@
 import math
 import random
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -79,21 +79,21 @@ class Layout2D:
             energy += self._similarity(ci, jdx, sim_cache) * dist
         return energy
 
-    def _local_energy_gpu(self, yx, center_idx, R, override=None) -> float:
+    def _local_energy_gpu(self, yx, center_idx, R, override=None) -> torch.Tensor:
         if self._code_tensor is None or self._cell_owner_flat is None or self._code_norms_t is None:
-            return 0.0
+            return torch.zeros((), dtype=torch.float32, device=self.device)
         ci = self._resolve_override(yx, center_idx, override)
         if ci is None:
-            return 0.0
+            return torch.zeros((), dtype=torch.float32, device=self.device)
         cell_id = self._cell_id_map.get(yx)
         if cell_id is None:
-            return 0.0
+            return torch.zeros((), dtype=torch.float32, device=self.device)
         neigh_idx = self._neighbor_indices_gpu[R]
         neigh_dist = self._neighbor_dists_gpu[R]
         neigh_mask = self._neighbor_mask_gpu[R]
         mask = neigh_mask[cell_id]
         if not bool(mask.any()):
-            return 0.0
+            return torch.zeros((), dtype=torch.float32, device=self.device)
         neighbors = neigh_idx[cell_id][mask]
         dists = neigh_dist[cell_id][mask]
         owners = self._cell_owner_flat.index_select(0, neighbors)
@@ -108,7 +108,7 @@ class Layout2D:
                     owners[eq_mask] = int(idx)
         valid = owners >= 0
         if not bool(valid.any()):
-            return 0.0
+            return torch.zeros((), dtype=torch.float32, device=self.device)
         owners = owners[valid]
         dists = dists[valid]
         center_vec = self._code_tensor[ci]
@@ -119,9 +119,9 @@ class Layout2D:
         denom = center_norm * neighbor_norms
         sims = torch.where(denom > 0.0, numerators / denom, torch.zeros_like(numerators))
         energy = torch.dot(sims, dists)
-        return float(energy.item())
+        return energy
 
-    def _local_energy(self, yx, center_idx, R, sim_cache, override=None) -> float:
+    def _local_energy(self, yx, center_idx, R, sim_cache, override=None) -> Union[float, torch.Tensor]:
         if self._code_tensor is not None and self._code_norms_t is not None and self._cell_owner_flat is not None:
             return self._local_energy_gpu(yx, center_idx, R, override=override)
         return self._local_energy_cpu(yx, center_idx, R, sim_cache, override=override)
@@ -240,34 +240,51 @@ class Layout2D:
                 for i in range(0, len(occupied) - 1, 2):
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
-                sim_cache: Dict[Tuple[int, int], float] = {}
-                for ia, yxa, ib, yxb in pairs:
-                    e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
-                            self._local_energy(yxb, ib, R, sim_cache)
-                    override = ((yxa, ib), (yxb, ia))
-                    e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
-                            self._local_energy(yxb, ia, R, sim_cache, override=override)
+                if not pairs:
+                    if on_epoch:
+                        on_epoch(phase, ep, self)
+                    continue
 
-                    if phase == "far":
-                        if e_swp + 1e-9 < e_cur:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if self._cell_owner_gpu is not None:
-                                self._cell_owner_gpu[yxa[0], yxa[1]] = int(ib)
-                                self._cell_owner_gpu[yxb[0], yxb[1]] = int(ia)
-                            if on_swap:
-                                on_swap(yxa, yxb, phase, ep, self)
-                    else:
-                        if e_swp > e_cur + 1e-9:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if self._cell_owner_gpu is not None:
-                                self._cell_owner_gpu[yxa[0], yxa[1]] = int(ib)
-                                self._cell_owner_gpu[yxb[0], yxb[1]] = int(ia)
-                            if on_swap:
-                                on_swap(yxa, yxb, phase, ep, self)
+                sim_cache: Dict[Tuple[int, int], float] = {}
+
+                def to_energy_tensor(value: Union[float, torch.Tensor]) -> torch.Tensor:
+                    if torch.is_tensor(value):
+                        return value
+                    return torch.tensor(float(value), dtype=torch.float32, device=self.device)
+
+                current_energies: List[torch.Tensor] = []
+                swapped_energies: List[torch.Tensor] = []
+                for ia, yxa, ib, yxb in pairs:
+                    cur_energy = to_energy_tensor(self._local_energy(yxa, ia, R, sim_cache)) + \
+                                 to_energy_tensor(self._local_energy(yxb, ib, R, sim_cache))
+                    override = ((yxa, ib), (yxb, ia))
+                    swp_energy = to_energy_tensor(self._local_energy(yxa, ib, R, sim_cache, override=override)) + \
+                                 to_energy_tensor(self._local_energy(yxb, ia, R, sim_cache, override=override))
+                    current_energies.append(cur_energy)
+                    swapped_energies.append(swp_energy)
+
+                e_cur_tensor = torch.stack(current_energies)
+                e_swp_tensor = torch.stack(swapped_energies)
+
+                e_cur_cpu = e_cur_tensor.detach().cpu()
+                e_swp_cpu = e_swp_tensor.detach().cpu()
+
+                if phase == "far":
+                    swap_mask = (e_swp_cpu + 1e-9) < e_cur_cpu
+                else:
+                    swap_mask = e_swp_cpu > (e_cur_cpu + 1e-9)
+
+                swap_indices = swap_mask.nonzero(as_tuple=False).view(-1).tolist()
+                for swap_idx in swap_indices:
+                    ia, yxa, ib, yxb = pairs[swap_idx]
+                    self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                    self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                    self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                    if self._cell_owner_gpu is not None:
+                        self._cell_owner_gpu[yxa[0], yxa[1]] = int(ib)
+                        self._cell_owner_gpu[yxb[0], yxb[1]] = int(ia)
+                    if on_swap:
+                        on_swap(yxa, yxb, phase, ep, self)
 
                 if on_epoch:
                     on_epoch(phase, ep, self)

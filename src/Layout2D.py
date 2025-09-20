@@ -111,39 +111,40 @@ class Layout2D:
             return torch.zeros((), dtype=torch.float32, device=self.device)
         owners = owners[valid]
         dists = dists[valid]
-        owner_list = [int(o) for o in owners.tolist()]
-        sims = torch.empty(len(owner_list), dtype=torch.float32, device=self.device)
-        missing_pairs: Dict[Tuple[int, int], List[int]] = {}
-        for idx, owner in enumerate(owner_list):
+        owner_ids = owners.detach().cpu().tolist()
+        sims = torch.empty(len(owner_ids), dtype=torch.float32, device=self.device)
+        cached_pos: List[int] = []
+        cached_vals: List[float] = []
+        missing_pos: List[int] = []
+        missing_ids: List[int] = []
+        for idx, owner in enumerate(owner_ids):
             pair = (ci, owner) if ci <= owner else (owner, ci)
             cached = sim_cache.get(pair)
             if cached is not None:
-                sims[idx] = float(cached)
+                cached_pos.append(idx)
+                cached_vals.append(float(cached))
             else:
-                missing_pairs.setdefault(pair, []).append(idx)
-        if missing_pairs:
-            unique_pairs = list(missing_pairs.keys())
-            other_ids = []
-            for a, b in unique_pairs:
-                if a == ci:
-                    other_ids.append(b)
-                elif b == ci:
-                    other_ids.append(a)
-                else:
-                    other_ids.append(b)
-            other_tensor = torch.tensor(other_ids, dtype=torch.long, device=self.device)
+                missing_pos.append(idx)
+                missing_ids.append(owner)
+        if cached_pos:
+            pos_tensor = torch.tensor(cached_pos, dtype=torch.long, device=self.device)
+            val_tensor = torch.tensor(cached_vals, dtype=torch.float32, device=self.device)
+            sims.index_copy_(0, pos_tensor, val_tensor)
+        if missing_pos:
+            pos_tensor = torch.tensor(missing_pos, dtype=torch.long, device=self.device)
+            owner_tensor = owners.index_select(0, pos_tensor)
             center_vec = self._code_tensor[ci]
-            neighbor_vecs = self._code_tensor.index_select(0, other_tensor)
+            neighbor_vecs = self._code_tensor.index_select(0, owner_tensor)
             numerators = torch.mv(neighbor_vecs, center_vec)
             center_norm = self._code_norms_t[ci]
-            neighbor_norms = self._code_norms_t.index_select(0, other_tensor)
+            neighbor_norms = self._code_norms_t.index_select(0, owner_tensor)
             denom = center_norm * neighbor_norms
             computed = torch.where(denom > 0.0, numerators / denom, torch.zeros_like(numerators))
-            for pair, value in zip(unique_pairs, computed):
-                value_scalar = float(value.detach().cpu())
-                for idx in missing_pairs[pair]:
-                    sims[idx] = value
-                sim_cache[pair] = value_scalar
+            sims.index_copy_(0, pos_tensor, computed)
+            computed_cpu = computed.detach().cpu().tolist()
+            for owner, value in zip(missing_ids, computed_cpu):
+                pair = (ci, owner) if ci <= owner else (owner, ci)
+                sim_cache[pair] = float(value)
         energy = torch.dot(sims, dists)
         return energy
 

@@ -79,7 +79,7 @@ class Layout2D:
             energy += self._similarity(ci, jdx, sim_cache) * dist
         return energy
 
-    def _local_energy_gpu(self, yx, center_idx, R, override=None) -> torch.Tensor:
+    def _local_energy_gpu(self, yx, center_idx, R, sim_cache, override=None) -> torch.Tensor:
         if self._code_tensor is None or self._cell_owner_flat is None or self._code_norms_t is None:
             return torch.zeros((), dtype=torch.float32, device=self.device)
         ci = self._resolve_override(yx, center_idx, override)
@@ -88,42 +88,60 @@ class Layout2D:
         cell_id = self._cell_id_map.get(yx)
         if cell_id is None:
             return torch.zeros((), dtype=torch.float32, device=self.device)
-        neigh_idx = self._neighbor_indices_gpu[R]
-        neigh_dist = self._neighbor_dists_gpu[R]
-        neigh_mask = self._neighbor_mask_gpu[R]
-        mask = neigh_mask[cell_id]
-        if not bool(mask.any()):
+        neighbor_infos = self._neighbor_cache.get(R, {}).get(yx)
+        if not neighbor_infos:
             return torch.zeros((), dtype=torch.float32, device=self.device)
-        neighbors = neigh_idx[cell_id][mask]
-        dists = neigh_dist[cell_id][mask]
-        owners = self._cell_owner_flat.index_select(0, neighbors)
-        if override:
-            owners = owners.clone()
-            for oyx, idx in override:
-                override_cell = self._cell_id_map.get(oyx)
-                if override_cell is None:
-                    continue
-                eq_mask = neighbors == override_cell
-                if bool(eq_mask.any()):
-                    owners[eq_mask] = int(idx)
-        valid = owners >= 0
-        if not bool(valid.any()):
+        valid_owner_ids: List[int] = []
+        valid_dists: List[float] = []
+        cached_indices: List[int] = []
+        cached_values: List[float] = []
+        missing_indices: List[int] = []
+        missing_pairs: List[Tuple[int, int]] = []
+        missing_owner_ids: List[int] = []
+        for ((ny, nx), dist) in neighbor_infos:
+            owner = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
+            if owner is None:
+                continue
+            owner_id = int(owner)
+            pos = len(valid_owner_ids)
+            valid_owner_ids.append(owner_id)
+            valid_dists.append(dist)
+            pair = (ci, owner_id) if ci <= owner_id else (owner_id, ci)
+            cached = sim_cache.get(pair)
+            if cached is not None:
+                cached_indices.append(pos)
+                cached_values.append(float(cached))
+            else:
+                missing_indices.append(pos)
+                missing_pairs.append(pair)
+                missing_owner_ids.append(owner_id)
+        if not valid_owner_ids:
             return torch.zeros((), dtype=torch.float32, device=self.device)
-        owners = owners[valid]
-        dists = dists[valid]
-        center_vec = self._code_tensor[ci]
-        neighbor_vecs = self._code_tensor.index_select(0, owners)
-        numerators = torch.mv(neighbor_vecs, center_vec)
-        center_norm = self._code_norms_t[ci]
-        neighbor_norms = self._code_norms_t.index_select(0, owners)
-        denom = center_norm * neighbor_norms
-        sims = torch.where(denom > 0.0, numerators / denom, torch.zeros_like(numerators))
-        energy = torch.dot(sims, dists)
+        dists_t = torch.tensor(valid_dists, dtype=torch.float32, device=self.device)
+        sims = torch.zeros(len(valid_owner_ids), dtype=torch.float32, device=self.device)
+        if cached_indices:
+            cache_idx_t = torch.tensor(cached_indices, dtype=torch.long, device=self.device)
+            cache_vals_t = torch.tensor(cached_values, dtype=torch.float32, device=self.device)
+            sims.index_copy_(0, cache_idx_t, cache_vals_t)
+        if missing_owner_ids:
+            miss_idx_t = torch.tensor(missing_indices, dtype=torch.long, device=self.device)
+            other_tensor = torch.tensor(missing_owner_ids, dtype=torch.long, device=self.device)
+            center_vec = self._code_tensor[ci]
+            neighbor_vecs = self._code_tensor.index_select(0, other_tensor)
+            numerators = torch.mv(neighbor_vecs, center_vec)
+            center_norm = self._code_norms_t[ci]
+            neighbor_norms = self._code_norms_t.index_select(0, other_tensor)
+            denom = center_norm * neighbor_norms
+            computed = torch.where(denom > 0.0, numerators / denom, torch.zeros_like(numerators))
+            sims.index_copy_(0, miss_idx_t, computed)
+            for pair, value in zip(missing_pairs, computed.detach().cpu().tolist()):
+                sim_cache[pair] = float(value)
+        energy = torch.dot(sims, dists_t)
         return energy
 
     def _local_energy(self, yx, center_idx, R, sim_cache, override=None) -> Union[float, torch.Tensor]:
         if self._code_tensor is not None and self._code_norms_t is not None and self._cell_owner_flat is not None:
-            return self._local_energy_gpu(yx, center_idx, R, override=override)
+            return self._local_energy_gpu(yx, center_idx, R, sim_cache, override=override)
         return self._local_energy_cpu(yx, center_idx, R, sim_cache, override=override)
 
     def _prepare_neighbors(self, radii: Iterable[int]) -> None:

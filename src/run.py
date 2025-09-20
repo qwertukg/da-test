@@ -35,6 +35,7 @@ def load_mnist_28x28(train_limit=1000, test_limit=200, seed=0):
 
 def rr_init(app_name: str = "digits-layout", spawn: bool = True, class_labels=None):
     rr.init(app_name, spawn=spawn)
+    rr.save("../out/rks.rrd")
     if class_labels is not None:
         ann = [AnnotationInfo(id=int(i), label=str(lbl)) for i, lbl in class_labels.items()]
         rr.log("layout", rr.AnnotationContext(ann), static=True)
@@ -138,7 +139,7 @@ def run() -> None:
 
     keyhole_angles_train: List[float] = [meta[2] for meta in keyhole_meta_train]
 
-    enc.print_keyhole_records(False)
+    enc.print_keyhole_records(True)
 
     lay = Layout2D(
         R_far=64, epochs_far=500,

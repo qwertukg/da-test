@@ -84,7 +84,14 @@ def rr_log_layout_ang(
         else:
             angle, _ = enc.code_dominant_orientation(code)
         col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
-    rr.set_time("step", sequence=step)
+    timeline_step = step
+    if isinstance(tag, str):
+        phase_name = tag.rsplit("/", 1)[-1]
+        if phase_name == "far":
+            timeline_step = step
+        elif phase_name == "near":
+            timeline_step = getattr(lay, "E_far", 0) + step
+    rr.set_time("step", sequence=timeline_step)
     rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
 
 

@@ -212,7 +212,8 @@ class Layout2D:
             order = list(indices)
             self.rng.shuffle(order)
             return order
-        rng = np.random.default_rng(self.rng.random())
+        # SeedSequence требует целочисленную энтропию, используем 32-битное значение из базового ГПСЧ
+        rng = np.random.default_rng(self.rng.randrange(2 ** 32))
         probs = selected_weights / selected_weights.sum()
         order = list(rng.choice(indices, size=len(indices), replace=False, p=probs))
         return order

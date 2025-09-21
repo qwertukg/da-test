@@ -159,11 +159,7 @@ class RandomKeyholeSamplingEncoder:
                 else:
                     cosine = shared / math.sqrt(prev_len * curr_len)
 
-                print(
-                    "    ∩ с предыдущим: "
-                    f"{overlap_pct:6.2f}% ({shared}/{union} битов); "
-                    f"cos={cosine:6.4f}"
-                )
+                print(f"∩: {overlap_pct:6.2f}% ({shared}/{union} битов) | cos={cosine:6.4f}")
 
             deg = ang * 180.0 / np.pi
             if as_barcode:

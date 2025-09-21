@@ -142,7 +142,7 @@ def run() -> None:
     keyhole_meta_train: List[Tuple[int, int, float]] = []
 
     for img_idx, img in enumerate(X_train):
-        enc_codes = enc.encode(img)
+        enc_codes = enc.encode(img, label=y_train[img_idx])
         if len(enc_codes) != len(enc.keyhole_records):
             raise RuntimeError(
                 "encode() должен заполнять keyhole_records для каждой скважины"

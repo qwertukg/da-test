@@ -146,7 +146,7 @@ def run() -> None:
     enc.print_keyhole_records(True)
 
     lay = Layout2D(
-        R_far=128, epochs_far=200,
+        R_far=64, epochs_far=200,
         R_near=3, epochs_near=0,
         seed=123
     )

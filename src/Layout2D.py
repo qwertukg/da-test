@@ -17,6 +17,8 @@ class Layout2D:
         self._code_norms: List[float] = []
         self._cell_owner_grid: List[List[Optional[int]]] = []
         self._neighbor_cache: Dict[int, Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]]] = {}
+        self._aux_vecs: Optional[List[Optional[Tuple[float, ...]]]] = None
+        self._aux_weight: float = 0.0
 
     @staticmethod
     def _grid_shape(n: int) -> Tuple[int, int]:
@@ -44,6 +46,12 @@ class Layout2D:
             sim = 0.0
         else:
             sim = len(self._codes[a] & self._codes[b]) / denom
+        if self._aux_vecs is not None and self._aux_weight > 0.0:
+            va = self._aux_vecs[a]
+            vb = self._aux_vecs[b]
+            if va is not None and vb is not None:
+                dot = sum(ax * bx for ax, bx in zip(va, vb))
+                sim += self._aux_weight * ((dot + 1.0) * 0.5)
         cache[(a, b)] = sim
         return sim
 
@@ -84,7 +92,13 @@ class Layout2D:
                 cache_R[(y, x)] = neighbors
             self._neighbor_cache[R] = cache_R
 
-    def fit(self, codes: List[Set[int]], on_epoch=None, on_swap=None):
+    def fit(self,
+            codes: List[Set[int]],
+            *,
+            aux_vectors: Optional[Sequence[Sequence[float]]] = None,
+            aux_weight: float = 0.0,
+            on_epoch=None,
+            on_swap=None):
         self._codes = codes
         n = len(codes)
         H, W = self._grid_shape(n);
@@ -95,6 +109,21 @@ class Layout2D:
         self._cell_owner_grid = [[None for _ in range(W)] for _ in range(H)]
         self._neighbor_cache.clear()
         self._code_norms = [math.sqrt(len(code)) if code else 0.0 for code in codes]
+        self._aux_vecs = None
+        self._aux_weight = 0.0
+        if aux_vectors is not None:
+            if len(aux_vectors) != n:
+                raise ValueError("длина aux_vectors должна совпадать с числом кодов")
+            normed: List[Optional[Tuple[float, ...]]] = []
+            for vec in aux_vectors:
+                arr = tuple(float(v) for v in vec)
+                norm = math.sqrt(sum(v * v for v in arr))
+                if norm == 0.0:
+                    normed.append(None)
+                else:
+                    normed.append(tuple(v / norm for v in arr))
+            self._aux_vecs = normed
+            self._aux_weight = float(aux_weight)
         self._prepare_neighbors([self.R_far, self.R_near])
         for i in range(n):
             yx = cells[i];

@@ -268,9 +268,33 @@ class RandomKeyholeSamplingEncoder:
             n = int(n)
             width = float(width)
             mus = [2.0 * np.pi * j / n for j in range(n)]
-            bits_tbl = [self._det_bits(f"L{L}:DET{j}:{self.seed}", self.bits_per_detector)
-                        for j in range(n)]
-            self._layers.append({"n": n, "width": width, "mu": mus, "bits": bits_tbl})
+
+            orient_bits = max(1, self.bits_per_detector // 2)
+            base_bits = max(0, self.bits_per_detector - orient_bits)
+
+            base_tbl = [
+                self._det_bits(f"L{L}:DET{j}:BASE:{self.seed}", base_bits)
+                for j in range(n)
+            ] if base_bits > 0 else [[] for _ in range(n)]
+            pos_tbl = [
+                self._det_bits(f"L{L}:DET{j}:POS:{self.seed}", orient_bits)
+                for j in range(n)
+            ]
+            neg_tbl = [
+                self._det_bits(f"L{L}:DET{j}:NEG:{self.seed}", orient_bits)
+                for j in range(n)
+            ]
+
+            self._layers.append({
+                "n": n,
+                "width": width,
+                "mu": mus,
+                "base_bits": base_tbl,
+                "pos_bits": pos_tbl,
+                "neg_bits": neg_tbl,
+                "orient_count": orient_bits,
+                "base_count": base_bits,
+            })
 
     @staticmethod
     def _circ_delta(a: float, b: float) -> float:
@@ -278,10 +302,21 @@ class RandomKeyholeSamplingEncoder:
         return abs((a - b + np.pi) % (2.0 * np.pi) - np.pi)
 
     def _det_bits(self, key: str, k: int) -> List[int]:
-        """Детерминированное отображение «детектор -> k битов»."""
+        """Детерминированное отображение «детектор -> k битов».
+
+        При k == 0 возвращает пустой список, что упрощает логику построения
+        нейтральных и ориентированных битов.
+        """
+        if k <= 0:
+            return []
         h = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=16).digest(), 'little')
         step = 0x9E3779B97F4A7C15
         return [int((h + i * step) % self.B) for i in range(k)]
+
+    @staticmethod
+    def _signed_circ_delta(a: float, b: float) -> float:
+        """Подписанная круговая разность углов в диапазоне [-π, π)."""
+        return float(((a - b + np.pi) % (2.0 * np.pi)) - np.pi)
 
     def _angle_bits_per_layer(self, angle: float) -> List[int]:
         """
@@ -294,7 +329,11 @@ class RandomKeyholeSamplingEncoder:
             n = layer["n"]            # type: ignore[assignment]
             width = layer["width"]    # type: ignore[assignment]
             mus = layer["mu"]         # type: ignore[assignment]
-            bits_tbl = layer["bits"]  # type: ignore[assignment]
+            base_tbl = layer["base_bits"]    # type: ignore[assignment]
+            pos_tbl = layer["pos_bits"]      # type: ignore[assignment]
+            neg_tbl = layer["neg_bits"]      # type: ignore[assignment]
+            orient_cnt = int(layer["orient_count"])  # type: ignore[arg-type]
+            base_cnt = int(layer["base_count"])      # type: ignore[arg-type]
             kL = min(self.detectors_per_layer[L], n)
 
             cand: List[Tuple[float, int]] = []
@@ -312,7 +351,14 @@ class RandomKeyholeSamplingEncoder:
                 chosen = [j for _, j in cand[:kL]]
 
             for j in chosen:
-                out.extend(bits_tbl[j])  # type: ignore[index]
+                if base_cnt:
+                    out.extend(base_tbl[j])  # type: ignore[index]
+                if orient_cnt:
+                    signed = self._signed_circ_delta(angle, mus[j])
+                    if signed >= 0.0:
+                        out.extend(pos_tbl[j])  # type: ignore[index]
+                    else:
+                        out.extend(neg_tbl[j])  # type: ignore[index]
 
         return out
 

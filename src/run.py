@@ -72,6 +72,7 @@ def rr_log_layout_ang(
         raise ValueError("длина angles должна совпадать с числом кодов")
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
+    labels: List[str] = []
     for i, code in enumerate(codes):
         y, x = lay.position_of(i)
         pos[i] = (x, y)
@@ -80,6 +81,8 @@ def rr_log_layout_ang(
         else:
             angle, _ = enc.code_dominant_orientation(code)
         col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
+        angle_deg = np.degrees(angle)
+        labels.append(f"угол={angle_deg:.1f}°")
     timeline_step = step
     if isinstance(tag, str):
         phase_name = tag.rsplit("/", 1)[-1]
@@ -88,7 +91,15 @@ def rr_log_layout_ang(
         elif phase_name == "near":
             timeline_step = getattr(lay, "E_far", 0) + step
     rr.set_time("step", sequence=timeline_step)
-    rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
+    rr.log(
+        f"{tag}",
+        rr.Points2D(
+            positions=pos,
+            colors=col,
+            radii=0.6,
+            labels=labels,
+        ),
+    )
 
 
 

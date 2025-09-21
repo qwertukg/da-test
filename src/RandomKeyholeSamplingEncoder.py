@@ -77,13 +77,16 @@ class RandomKeyholeSamplingEncoder:
         # --- НОВОЕ: сюда пишем по каждой скважине (angle, code) ---
         # После каждого encode() список перезаписывается заново.
         self.keyhole_records: List[Tuple[float, Set[int]]] = []
+        # --- метка текущего изображения ---
+        self.current_img_label: Optional[object] = None
 
     # ==================== ПУБЛИЧНОЕ API ====================
 
-    def encode(self, img: np.ndarray) -> List[Set[int]]:
+    def encode(self, img: np.ndarray, label: Optional[object] = None) -> List[Set[int]]:
         """
         Кодирует изображение в СПИСОК кодов скважин (1 скважина -> 1 код).
-        Также заполняет self.keyhole_records списком (angle, code).
+        Также заполняет self.keyhole_records списком (angle, code)
+        и сохраняет метку изображения, если она передана.
         """
         H, W = img.shape
         if (H, W) != (self.H, self.W):
@@ -91,6 +94,7 @@ class RandomKeyholeSamplingEncoder:
 
         # сбрасываем записи прошлых вызовов
         self.keyhole_records = []
+        self.current_img_label = label
 
         # 1) Собель
         gx, gy = self._sobel(img)
@@ -135,6 +139,9 @@ class RandomKeyholeSamplingEncoder:
 
         # сортировка по возрастанию угла
         recs = sorted(self.keyhole_records, key=lambda t: t[0])
+
+        label_repr = self.current_img_label if self.current_img_label is not None else "(метка не задана)"
+        print(f"Метка класса: {label_repr}")
 
         for ang, code in recs:
             deg = ang * 180.0 / np.pi

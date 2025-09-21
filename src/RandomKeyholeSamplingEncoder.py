@@ -145,50 +145,6 @@ class RandomKeyholeSamplingEncoder:
                 s = f"indices={inds}"
             print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
 
-    def average_density(self, codes_per_keyhole: List[Set[int]]) -> float:
-        """
-        Средняя плотность по скважинам: mean_k(|code_k| / B).
-        """
-        if not codes_per_keyhole:
-            print("avg_density (per keyhole) = 0.000000")
-            return 0.0
-        densities = [len(c) / float(self.B) for c in codes_per_keyhole]
-        avg_density = float(sum(densities) / len(densities))
-        print(f"avg_density (per keyhole) = {avg_density:.6f}")
-        return avg_density
-
-    def print_density_and_overlap(self, codes_per_keyhole: List[Set[int]]) -> Tuple[float, float]:
-        """
-        Метрики ПО СКВАЖИНАМ (для одного изображения).
-        avg_density = mean_k( |code_k| / B )
-        avg_overlap = средний Яккард по всем парам скважин (J=1.0 для двух пустых).
-        """
-        n = len(codes_per_keyhole)
-        if n == 0:
-            print("avg_density=0.0, avg_overlap=0.0 (скважин нет)")
-            return 0.0, 0.0
-
-        densities = [len(c) / float(self.B) for c in codes_per_keyhole]
-        avg_density = float(sum(densities) / n)
-
-        pair_sum = 0.0
-        pair_cnt = 0
-        for i in range(n):
-            A = codes_per_keyhole[i]
-            for j in range(i + 1, n):
-                B = codes_per_keyhole[j]
-                if not A and not B:
-                    jacc = 1.0
-                else:
-                    union = len(A | B)
-                    jacc = (len(A & B) / union) if union > 0 else 0.0
-                pair_sum += jacc
-                pair_cnt += 1
-
-        avg_overlap = (pair_sum / pair_cnt) if pair_cnt > 0 else 0.0
-        print(f"avg_density (per keyhole) = {avg_density:.6f}")
-        print(f"avg_overlap (Jaccard, between keyholes) = {avg_overlap:.6f}")
-        return avg_density, avg_overlap
 
     # ==================== ВНУТРЕННЕЕ ====================
 

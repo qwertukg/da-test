@@ -4,7 +4,6 @@ from typing import List, Tuple, Set, Optional
 import numpy as np
 import rerun as rr
 from matplotlib.colors import hsv_to_rgb
-from rerun.datatypes import AnnotationInfo
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
@@ -36,9 +35,6 @@ def load_mnist_28x28(train_limit=1000, test_limit=200, seed=0):
 def rr_init(app_name: str = "digits-layout", spawn: bool = True, class_labels=None):
     rr.init(app_name, spawn=spawn)
     # rr.save("../out/rks.rrd")
-    if class_labels is not None:
-        ann = [AnnotationInfo(id=int(i), label=str(lbl)) for i, lbl in class_labels.items()]
-        rr.log("layout", rr.AnnotationContext(ann), static=True)
 
 
 def rgb_from_bits(bits: Set[int]) -> Tuple[int, int, int]:
@@ -111,7 +107,7 @@ def run() -> None:
         )
 
 
-    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=100, test_limit=20, seed=0)
+    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=10, test_limit=0, seed=2)
 
     enc = RandomKeyholeSamplingEncoder(
         img_hw=(28, 28),
@@ -149,8 +145,8 @@ def run() -> None:
     enc.print_keyhole_records(True)
 
     lay = Layout2D(
-        R_far=64, epochs_far=100,
-        R_near=3, epochs_near=100,
+        R_far=128, epochs_far=200,
+        R_near=3, epochs_near=0,
         seed=123
     )
 

@@ -43,17 +43,41 @@ class Layout2D:
         if denom == 0.0:
             sim = 0.0
         else:
-            sim = len(self._codes[a] & self._codes[b]) / denom
+            ca = self._codes[a]
+            cb = self._codes[b]
+            if len(ca) > len(cb):
+                ca, cb = cb, ca
+            inter = sum(1 for item in ca if item in cb)
+            sim = inter / denom
         cache[(a, b)] = sim
         return sim
 
     def _local_energy(self, yx, center_idx, R, sim_cache, override=None) -> float:
-        ci = self._resolve_override(yx, center_idx, override)
+        override_map = None
+        if override:
+            if isinstance(override, dict):
+                override_map = override
+            else:
+                override_map = dict(override)
+        if override_map is not None:
+            ci = override_map.get(yx, center_idx)
+        else:
+            ci = center_idx
         if ci is None:
             return 0.0
         energy = 0.0
-        for (ny, nx), dist in self._neighbors(yx[0], yx[1], R):
-            jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
+        owner_grid = self._cell_owner_grid
+        neighbors = self._neighbor_cache[R][yx]
+        if override_map is not None:
+            for (ny, nx), dist in neighbors:
+                jdx = override_map.get((ny, nx), owner_grid[ny][nx])
+                if jdx is None:
+                    continue
+                energy += self._similarity(ci, jdx, sim_cache) * dist
+            return energy
+
+        for (ny, nx), dist in neighbors:
+            jdx = owner_grid[ny][nx]
             if jdx is None:
                 continue
             energy += self._similarity(ci, jdx, sim_cache) * dist
@@ -61,27 +85,36 @@ class Layout2D:
 
     def _prepare_neighbors(self, radii: Iterable[int]) -> None:
         H, W = self.shape
-        all_cells = [(y, x) for y in range(H) for x in range(W)]
+        if H == 0 or W == 0:
+            return
         for R in set(radii):
             cache_R: Dict[Tuple[int, int], List[Tuple[Tuple[int, int], float]]] = {}
             if R <= 0:
-                for cell in all_cells:
-                    cache_R[cell] = []
+                for y in range(H):
+                    for x in range(W):
+                        cache_R[(y, x)] = []
                 self._neighbor_cache[R] = cache_R
                 continue
-            for y, x in all_cells:
-                neighbors: List[Tuple[Tuple[int, int], float]] = []
-                for dy in range(-R, R + 1):
-                    for dx in range(-R, R + 1):
-                        if dy == 0 and dx == 0:
-                            continue
-                        dist = math.hypot(dy, dx)
-                        if dist > R:
-                            continue
+
+            offsets: List[Tuple[int, int, float]] = []
+            RR = R * R
+            for dy in range(-R, R + 1):
+                for dx in range(-R, R + 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    dist_sq = dy * dy + dx * dx
+                    if dist_sq > RR:
+                        continue
+                    offsets.append((dy, dx, math.sqrt(dist_sq)))
+
+            for y in range(H):
+                for x in range(W):
+                    neighbors: List[Tuple[Tuple[int, int], float]] = []
+                    for dy, dx, dist in offsets:
                         ny, nx = y + dy, x + dx
                         if 0 <= ny < H and 0 <= nx < W:
                             neighbors.append(((ny, nx), dist))
-                cache_R[(y, x)] = neighbors
+                    cache_R[(y, x)] = neighbors
             self._neighbor_cache[R] = cache_R
 
     def fit(self, codes: List[Set[int]], on_epoch=None, on_swap=None):
@@ -102,32 +135,37 @@ class Layout2D:
             self._cell_owner_grid[yx[0]][yx[1]] = i
 
         def pass_epoch(R: int, iters: int, phase: str):
+            rng = self.rng
+            idx2cell_local = self.idx2cell
+            grid = self._cell_owner_grid
+            local_energy = self._local_energy
             for ep in range(iters):
-                occupied = list(self.idx2cell.items());
-                self.rng.shuffle(occupied)
-                pairs = []
-                for i in range(0, len(occupied) - 1, 2):
-                    (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
-                    pairs.append((ia, yxa, ib, yxb))
+                indices = list(idx2cell_local)
+                rng.shuffle(indices)
                 sim_cache: Dict[Tuple[int, int], float] = {}
-                for ia, yxa, ib, yxb in pairs:
-                    e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
-                            self._local_energy(yxb, ib, R, sim_cache)
-                    override = ((yxa, ib), (yxb, ia))
-                    e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
-                            self._local_energy(yxb, ia, R, sim_cache, override=override)
+                for i in range(0, len(indices) - 1, 2):
+                    ia = indices[i]
+                    ib = indices[i + 1]
+                    yxa = idx2cell_local[ia]
+                    yxb = idx2cell_local[ib]
+
+                    e_cur = local_energy(yxa, ia, R, sim_cache) + \
+                            local_energy(yxb, ib, R, sim_cache)
+                    override_map = {yxa: ib, yxb: ia}
+                    e_swp = local_energy(yxa, ib, R, sim_cache, override=override_map) + \
+                            local_energy(yxb, ia, R, sim_cache, override=override_map)
 
                     if phase == "far":
                         if e_swp + 1e-9 < e_cur:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                            idx2cell_local[ia], idx2cell_local[ib] = yxb, yxa
+                            grid[yxa[0]][yxa[1]] = ib
+                            grid[yxb[0]][yxb[1]] = ia
                             if on_swap: on_swap(yxa, yxb, phase, ep, self)
                     else:
                         if e_swp > e_cur + 1e-9:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                            idx2cell_local[ia], idx2cell_local[ib] = yxb, yxa
+                            grid[yxa[0]][yxa[1]] = ib
+                            grid[yxb[0]][yxb[1]] = ia
                             if on_swap: on_swap(yxa, yxb, phase, ep, self)
 
                 if on_epoch: on_epoch(phase, ep, self)

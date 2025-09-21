@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import math
 import random
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import torch
+
 
 class Layout2D:
 
-    def __init__(self, R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123):
+    def __init__(self, R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123,
+                 *, use_torch_energy: bool = False, torch_device: Optional[str] = None):
         self.R_far = R_far
         self.R_near = R_near
         self.E_far = epochs_far
@@ -19,6 +24,9 @@ class Layout2D:
         self._neighbor_cache: Dict[int, Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]]] = {}
         self._aux_vecs: Optional[List[Optional[Tuple[float, ...]]]] = None
         self._aux_weight: float = 0.0
+        self._use_torch_energy = bool(use_torch_energy)
+        self._torch_device = torch_device
+        self._torch_calc: Optional[_TorchEnergyCalculator] = None
 
     @staticmethod
     def _grid_shape(n: int) -> Tuple[int, int]:
@@ -59,6 +67,18 @@ class Layout2D:
         ci = self._resolve_override(yx, center_idx, override)
         if ci is None:
             return 0.0
+        if self._torch_calc is not None:
+            neighbor_indices: List[int] = []
+            distances: List[float] = []
+            for (ny, nx), dist in self._neighbors(yx[0], yx[1], R):
+                jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
+                if jdx is None:
+                    continue
+                neighbor_indices.append(jdx)
+                distances.append(dist)
+            if not neighbor_indices:
+                return 0.0
+            return self._torch_calc.local_energy(ci, neighbor_indices, distances)
         energy = 0.0
         for (ny, nx), dist in self._neighbors(yx[0], yx[1], R):
             jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
@@ -124,6 +144,16 @@ class Layout2D:
                     normed.append(tuple(v / norm for v in arr))
             self._aux_vecs = normed
             self._aux_weight = float(aux_weight)
+        if self._use_torch_energy:
+            self._torch_calc = _TorchEnergyCalculator(
+                codes,
+                self._code_norms,
+                self._aux_vecs,
+                self._aux_weight,
+                device=self._torch_device,
+            )
+        else:
+            self._torch_calc = None
         self._prepare_neighbors([self.R_far, self.R_near])
         for i in range(n):
             yx = cells[i];
@@ -176,3 +206,107 @@ class Layout2D:
             return 0.0
         inter = len(a & b)
         return inter / math.sqrt(len(a) * len(b))
+
+
+class _TorchEnergyCalculator:
+
+    def __init__(
+            self,
+            codes: Sequence[Set[int]],
+            code_norms: Sequence[float],
+            aux_vectors: Optional[Sequence[Optional[Tuple[float, ...]]]],
+            aux_weight: float,
+            *,
+            device: Optional[str] = None,
+    ) -> None:
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+        self.device = torch.device(device)
+        self.word_size = 64
+        self.code_norms = torch.tensor(code_norms, dtype=torch.float32, device=self.device)
+        self.aux_weight = float(aux_weight)
+        self._bit_masks = (1 << torch.arange(self.word_size, dtype=torch.int64, device=self.device))
+        self._codes = self._encode_codes(codes)
+        self._aux_vecs, self._aux_mask = self._encode_aux(aux_vectors)
+
+    def _encode_codes(self, codes: Sequence[Set[int]]) -> torch.Tensor:
+        if not codes:
+            return torch.zeros((0, 0), dtype=torch.int64, device=self.device)
+        max_bit = -1
+        for code in codes:
+            if code:
+                local_max = max(code)
+                if local_max > max_bit:
+                    max_bit = local_max
+        if max_bit < 0:
+            return torch.zeros((len(codes), 0), dtype=torch.int64, device=self.device)
+        words = (max_bit // self.word_size) + 1
+        data = torch.zeros((len(codes), words), dtype=torch.int64, device=self.device)
+        for idx, code in enumerate(codes):
+            if not code:
+                continue
+            row = data[idx]
+            for bit in code:
+                word = bit // self.word_size
+                offset = bit % self.word_size
+                row[word] |= (1 << offset)
+        return data
+
+    def _encode_aux(
+            self,
+            aux_vectors: Optional[Sequence[Optional[Tuple[float, ...]]]],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if aux_vectors is None:
+            return None, None
+        dim = None
+        for vec in aux_vectors:
+            if vec is not None:
+                dim = len(vec)
+                break
+        if dim is None:
+            return None, None
+        aux = torch.zeros((len(aux_vectors), dim), dtype=torch.float32, device=self.device)
+        mask = torch.zeros(len(aux_vectors), dtype=torch.bool, device=self.device)
+        for idx, vec in enumerate(aux_vectors):
+            if vec is None:
+                continue
+            aux[idx] = torch.tensor(vec, dtype=torch.float32, device=self.device)
+            mask[idx] = True
+        return aux, mask
+
+    def local_energy(
+            self,
+            center_idx: int,
+            neighbor_indices: Sequence[int],
+            distances: Sequence[float],
+    ) -> float:
+        if not neighbor_indices:
+            return 0.0
+        neighbor_idx = torch.tensor(neighbor_indices, dtype=torch.long, device=self.device)
+        dist = torch.tensor(distances, dtype=torch.float32, device=self.device)
+        if self._codes.size(1) == 0:
+            overlaps = torch.zeros(neighbor_idx.shape[0], dtype=torch.float32, device=self.device)
+        else:
+            center_words = self._codes[center_idx]
+            neighbor_words = torch.index_select(self._codes, 0, neighbor_idx)
+            intersections = torch.bitwise_and(neighbor_words, center_words)
+            bit_hits = torch.bitwise_and(intersections.unsqueeze(-1), self._bit_masks)
+            overlaps = bit_hits.ne(0).sum(dim=-1).sum(dim=-1).to(torch.float32)
+        denom = self.code_norms[center_idx] * torch.index_select(self.code_norms, 0, neighbor_idx)
+        sims = torch.zeros_like(overlaps)
+        valid = denom > 0
+        if valid.any():
+            sims[valid] = overlaps[valid] / denom[valid]
+        if self._aux_vecs is not None and self.aux_weight > 0.0:
+            if self._aux_mask is not None and self._aux_mask[center_idx]:
+                neighbor_mask = torch.index_select(self._aux_mask, 0, neighbor_idx)
+                if neighbor_mask.any():
+                    center_vec = self._aux_vecs[center_idx]
+                    vecs = torch.index_select(self._aux_vecs, 0, neighbor_idx[neighbor_mask])
+                    dots = torch.matmul(vecs, center_vec)
+                    sims[neighbor_mask] += self.aux_weight * ((dots + 1.0) * 0.5)
+        energy = torch.dot(sims, dist)
+        return float(energy.item())

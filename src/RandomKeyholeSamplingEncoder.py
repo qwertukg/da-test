@@ -143,7 +143,34 @@ class RandomKeyholeSamplingEncoder:
         label_repr = self.current_img_label if self.current_img_label is not None else "(метка не задана)"
         print(f"Метка класса: {label_repr}")
 
-        for ang, code in recs:
+        prev_code: Optional[Set[int]] = None
+        first_code: Optional[Set[int]] = recs[0][1] if recs else None
+        total_recs = len(recs)
+
+        def _print_overlap(prefix: str, code_a: Set[int], code_b: Set[int]) -> None:
+            shared = len(code_a & code_b)
+            union = len(code_a | code_b)
+            overlap_pct = 100.0 if union == 0 else (shared / union) * 100.0
+
+            len_a = len(code_a)
+            len_b = len(code_b)
+            if len_a == 0 and len_b == 0:
+                cosine_val = 1.0
+            elif len_a == 0 or len_b == 0:
+                cosine_val = 0.0
+            else:
+                cosine_val = shared / math.sqrt(len_a * len_b)
+
+            print(
+                f"    ∩ {prefix}: "
+                f"{overlap_pct:6.2f}% ({shared}/{union} битов); "
+                f"cos={cosine_val:6.4f}"
+            )
+
+        for idx, (ang, code) in enumerate(recs):
+            if prev_code is not None:
+                _print_overlap("с предыдущим", prev_code, code)
+
             deg = ang * 180.0 / np.pi
             if as_barcode:
                 s = self._bits_to_barcode(code)
@@ -151,6 +178,9 @@ class RandomKeyholeSamplingEncoder:
                 inds = sorted(int(b) for b in code)
                 s = f"indices={inds}"
             print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
+            if idx == total_recs - 1 and first_code is not None and total_recs > 1:
+                _print_overlap("с первым", code, first_code)
+            prev_code = code
 
 
     # ==================== ВНУТРЕННЕЕ ====================

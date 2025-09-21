@@ -5,12 +5,21 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 class Layout2D:
 
-    def __init__(self, R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123):
+    def __init__(
+        self,
+        R_far: int = 7,
+        R_near: int = 3,
+        epochs_far: int = 8,
+        epochs_near: int = 6,
+        seed: int = 123,
+        energy_batch_size: Optional[int] = 64,
+    ):
         self.R_far = R_far
         self.R_near = R_near
         self.E_far = epochs_far
         self.E_near = epochs_near
         self.rng = random.Random(seed)
+        self.energy_batch_size = energy_batch_size
         self.shape: Tuple[int, int] = (0, 0)
         self.idx2cell: Dict[int, Tuple[int, int]] = {}
         self._codes: List[Set[int]] = []
@@ -26,14 +35,6 @@ class Layout2D:
     def _neighbors(self, y: int, x: int, R: int) -> Sequence[Tuple[Tuple[int, int], float]]:
         return self._neighbor_cache[R][(y, x)]
 
-    @staticmethod
-    def _resolve_override(cell: Tuple[int, int], default_idx: Optional[int], override) -> Optional[int]:
-        if override:
-            for oyx, idx in override:
-                if oyx == cell:
-                    return idx
-        return default_idx
-
     def _similarity(self, ia: int, ib: int, cache: Dict[Tuple[int, int], float]) -> float:
         a, b = (ia, ib) if ia <= ib else (ib, ia)
         cached = cache.get((a, b))
@@ -47,17 +48,82 @@ class Layout2D:
         cache[(a, b)] = sim
         return sim
 
-    def _local_energy(self, yx, center_idx, R, sim_cache, override=None) -> float:
-        ci = self._resolve_override(yx, center_idx, override)
-        if ci is None:
-            return 0.0
-        energy = 0.0
-        for (ny, nx), dist in self._neighbors(yx[0], yx[1], R):
-            jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
-            if jdx is None:
+    def _cell_energy_pair(
+        self,
+        center_cell: Tuple[int, int],
+        idx_before: int,
+        idx_after: int,
+        other_cell: Tuple[int, int],
+        other_idx_before: int,
+        other_idx_after: int,
+        R: int,
+        sim_cache: Dict[Tuple[int, int], float],
+    ) -> Tuple[float, float]:
+        """Считает вклад одной точки пары до и после свапа.
+
+        Реализация следует разделу 5.5 статьи DAML: в рамках одного прохода
+        одновременно накапливаются энергии φ_c и φ_s, чтобы не перечитывать
+        данные из пространства кода. Локальная аппроксимация учитывает только
+        окрестность радиуса *R* (аналог раздела 5.5.2).
+        """
+
+        energy_before = 0.0
+        energy_after = 0.0
+        cy, cx = center_cell
+        neighbors = self._neighbors(cy, cx, R)
+        for (ny, nx), dist in neighbors:
+            neighbor_idx = self._cell_owner_grid[ny][nx]
+            if neighbor_idx is None:
                 continue
-            energy += self._similarity(ci, jdx, sim_cache) * dist
-        return energy
+            neighbor_idx_before = (
+                other_idx_before if (ny, nx) == other_cell else neighbor_idx
+            )
+            neighbor_idx_after = (
+                other_idx_after if (ny, nx) == other_cell else neighbor_idx
+            )
+            energy_before += self._similarity(idx_before, neighbor_idx_before, sim_cache) * dist
+            energy_after += self._similarity(idx_after, neighbor_idx_after, sim_cache) * dist
+        return energy_before, energy_after
+
+    def _pair_energy_batch(
+        self,
+        batch: Sequence[Tuple[int, Tuple[int, int], int, Tuple[int, int]]],
+        R: int,
+        sim_cache: Dict[Tuple[int, int], float],
+    ) -> Tuple[List[float], List[float]]:
+        """Возвращает энергии пар до и после обмена для батча.
+
+        Подход копирует схему «батчевого» расчёта из раздела 5.12 статьи DAML:
+        сначала вычисляется вклад всех пар при неизменном состоянии, затем
+        суммарные энергии используются при принятии решения о свапе.
+        """
+
+        cur_vals: List[float] = []
+        swap_vals: List[float] = []
+        for ia, yxa, ib, yxb in batch:
+            cur_a, swap_a = self._cell_energy_pair(
+                yxa,
+                ia,
+                ib,
+                yxb,
+                ib,
+                ia,
+                R,
+                sim_cache,
+            )
+            cur_b, swap_b = self._cell_energy_pair(
+                yxb,
+                ib,
+                ia,
+                yxa,
+                ia,
+                ib,
+                R,
+                sim_cache,
+            )
+            cur_vals.append(cur_a + cur_b)
+            swap_vals.append(swap_a + swap_b)
+        return cur_vals, swap_vals
 
     def _prepare_neighbors(self, radii: Iterable[int]) -> None:
         H, W = self.shape
@@ -109,26 +175,26 @@ class Layout2D:
                 for i in range(0, len(occupied) - 1, 2):
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
+                if not pairs:
+                    continue
                 sim_cache: Dict[Tuple[int, int], float] = {}
-                for ia, yxa, ib, yxb in pairs:
-                    e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
-                            self._local_energy(yxb, ib, R, sim_cache)
-                    override = ((yxa, ib), (yxb, ia))
-                    e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
-                            self._local_energy(yxb, ia, R, sim_cache, override=override)
-
-                    if phase == "far":
-                        if e_swp + 1e-9 < e_cur:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if on_swap: on_swap(yxa, yxb, phase, ep, self)
-                    else:
-                        if e_swp > e_cur + 1e-9:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                batch_size = self.energy_batch_size if self.energy_batch_size and self.energy_batch_size > 0 else len(pairs)
+                for start in range(0, len(pairs), batch_size):
+                    batch = pairs[start:start + batch_size]
+                    cur_vals, swap_vals = self._pair_energy_batch(batch, R, sim_cache)
+                    for (ia, yxa, ib, yxb), e_cur, e_swp in zip(batch, cur_vals, swap_vals):
+                        if phase == "far":
+                            if e_swp + 1e-9 < e_cur:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                        else:
+                            if e_swp > e_cur + 1e-9:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
 
                 if on_epoch: on_epoch(phase, ep, self)
 

@@ -1,4 +1,5 @@
 import hashlib
+import math
 from typing import List, Tuple, Set, Optional
 
 import numpy as np
@@ -150,7 +151,14 @@ def run() -> None:
         seed=123
     )
 
-    lay.fit(keyhole_codes_train, on_epoch=on_epoch_dots)
+    angle_vectors = [(math.cos(angle), math.sin(angle)) for angle in keyhole_angles_train]
+
+    lay.fit(
+        keyhole_codes_train,
+        aux_vectors=angle_vectors,
+        aux_weight=0.2,
+        on_epoch=on_epoch_dots,
+    )
 
 
 

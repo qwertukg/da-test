@@ -3,6 +3,7 @@ from typing import List, Tuple, Set, Optional
 
 import numpy as np
 import rerun as rr
+import torch
 from matplotlib.colors import hsv_to_rgb
 from torchvision import transforms
 from torchvision.datasets import MNIST
@@ -155,10 +156,13 @@ def run() -> None:
 
     enc.print_keyhole_records(True)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     lay = Layout2D(
         R_far=128, epochs_far=200,
         R_near=3, epochs_near=0,
-        seed=123
+        seed=123,
+        device=device,
     )
 
     lay.fit(keyhole_codes_train, on_epoch=on_epoch_dots)

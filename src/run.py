@@ -43,17 +43,6 @@ def rgb_from_bits(bits: Set[int]) -> Tuple[int, int, int]:
     return (h[0], h[1], h[2])
 
 
-def rr_log_layout_bits(lay: Layout2D, codes: List[Set[int]], enc, tag="layout", step=0):
-    N = len(codes)
-    pos = np.zeros((N, 2), dtype=np.float32)
-    col = np.zeros((N, 3), dtype=np.uint8)
-    for i in range(N):
-        y, x = lay.position_of(i)
-        pos[i] = (x, y)
-        col[i] = np.array(rgb_from_bits(codes[i]), dtype=np.uint8)
-    rr.set_time("step", sequence=step)
-    rr.log(f"{tag}", rr.Points2D(positions=pos, colors=col, radii=0.6))
-
 def rgb_from_angle(angle_rad: float):
     h = (angle_rad / (np.pi*2)) % 1.0
     r, g, b = (hsv_to_rgb([[h, 1.0, 1.0]])[0] * 255).astype(np.uint8)
@@ -82,7 +71,7 @@ def rr_log_layout_ang(
             angle, _ = enc.code_dominant_orientation(code)
         col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
         angle_deg = np.degrees(angle)
-        labels.append(f"угол={angle_deg:.1f}°")
+        labels.append(f"{angle_deg:.2f}°")
     timeline_step = step
     if isinstance(tag, str):
         phase_name = tag.rsplit("/", 1)[-1]
@@ -118,7 +107,7 @@ def run() -> None:
         )
 
 
-    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=10, test_limit=0, seed=2)
+    X_train, X_test, y_train, y_test = load_mnist_28x28(train_limit=10, test_limit=0, seed=11)
 
     enc = RandomKeyholeSamplingEncoder(
         img_hw=(28, 28),

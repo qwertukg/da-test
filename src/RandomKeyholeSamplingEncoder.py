@@ -161,11 +161,7 @@ class RandomKeyholeSamplingEncoder:
             else:
                 cosine_val = shared / math.sqrt(len_a * len_b)
 
-            print(
-                f"    ∩ {prefix}: "
-                f"{overlap_pct:6.2f}% ({shared}/{union} битов); "
-                f"cos={cosine_val:6.4f}"
-            )
+            print(f"∩ {prefix}: {overlap_pct:6.2f}% ({shared}/{union} бит); cos: {(cosine_val*100):6.2f}%")
 
         for idx, (ang, code) in enumerate(recs):
             if prev_code is not None:

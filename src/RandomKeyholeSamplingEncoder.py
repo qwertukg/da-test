@@ -143,7 +143,28 @@ class RandomKeyholeSamplingEncoder:
         label_repr = self.current_img_label if self.current_img_label is not None else "(метка не задана)"
         print(f"Метка класса: {label_repr}")
 
+        prev_code: Optional[Set[int]] = None
         for ang, code in recs:
+            if prev_code is not None:
+                shared = len(prev_code & code)
+                union = len(prev_code | code)
+                overlap_pct = 100.0 if union == 0 else (shared / union) * 100.0
+
+                prev_len = len(prev_code)
+                curr_len = len(code)
+                if prev_len == 0 and curr_len == 0:
+                    cosine = 1.0
+                elif prev_len == 0 or curr_len == 0:
+                    cosine = 0.0
+                else:
+                    cosine = shared / math.sqrt(prev_len * curr_len)
+
+                print(
+                    "    ∩ с предыдущим: "
+                    f"{overlap_pct:6.2f}% ({shared}/{union} битов); "
+                    f"cos={cosine:6.4f}"
+                )
+
             deg = ang * 180.0 / np.pi
             if as_barcode:
                 s = self._bits_to_barcode(code)
@@ -151,6 +172,7 @@ class RandomKeyholeSamplingEncoder:
                 inds = sorted(int(b) for b in code)
                 s = f"indices={inds}"
             print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
+            prev_code = code
 
 
     # ==================== ВНУТРЕННЕЕ ====================

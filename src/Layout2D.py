@@ -15,6 +15,7 @@ class Layout2D:
         self.idx2cell: Dict[int, Tuple[int, int]] = {}
         self._codes: List[Set[int]] = []
         self._code_norms: List[float] = []
+        self._code_bitmasks: List[int] = []
         self._cell_owner_grid: List[List[Optional[int]]] = []
         self._neighbor_cache: Dict[int, Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]]] = {}
         self._aux_vecs: Optional[List[Optional[Tuple[float, ...]]]] = None
@@ -24,6 +25,13 @@ class Layout2D:
     def _grid_shape(n: int) -> Tuple[int, int]:
         s = math.ceil(math.sqrt(n));
         return (s, s)
+
+    @staticmethod
+    def _code_to_bitmask(code: Set[int]) -> int:
+        bitmask = 0
+        for bit in code:
+            bitmask |= 1 << bit
+        return bitmask
 
     def _neighbors(self, y: int, x: int, R: int) -> Sequence[Tuple[Tuple[int, int], float]]:
         return self._neighbor_cache[R][(y, x)]
@@ -45,7 +53,8 @@ class Layout2D:
         if denom == 0.0:
             sim = 0.0
         else:
-            sim = len(self._codes[a] & self._codes[b]) / denom
+            inter = (self._code_bitmasks[a] & self._code_bitmasks[b]).bit_count()
+            sim = inter / denom
         if self._aux_vecs is not None and self._aux_weight > 0.0:
             va = self._aux_vecs[a]
             vb = self._aux_vecs[b]
@@ -100,6 +109,7 @@ class Layout2D:
             on_epoch=None,
             on_swap=None):
         self._codes = codes
+        self._code_bitmasks = [self._code_to_bitmask(code) for code in codes]
         n = len(codes)
         H, W = self._grid_shape(n);
         self.shape = (H, W)
@@ -174,5 +184,7 @@ class Layout2D:
     def cosbin(self, a: Set[int], b: Set[int]) -> float:
         if not a or not b:
             return 0.0
-        inter = len(a & b)
+        mask_a = self._code_to_bitmask(a)
+        mask_b = self._code_to_bitmask(b)
+        inter = (mask_a & mask_b).bit_count()
         return inter / math.sqrt(len(a) * len(b))

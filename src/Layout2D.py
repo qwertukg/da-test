@@ -1,4 +1,5 @@
 import math
+import multiprocessing as mp
 import random
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -20,6 +21,16 @@ class Layout2D:
         self._neighbor_cache: Dict[int, Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]]] = {}
         self._aux_vecs: Optional[List[Optional[Tuple[float, ...]]]] = None
         self._aux_weight: float = 0.0
+
+    def _make_worker_snapshot(self, R: int) -> Dict[str, object]:
+        return {
+            "neighbors": self._neighbor_cache[R],
+            "cell_owner_grid": tuple(tuple(row) for row in self._cell_owner_grid),
+            "code_bitmasks": self._code_bitmasks,
+            "code_norms": self._code_norms,
+            "aux_vecs": self._aux_vecs,
+            "aux_weight": self._aux_weight,
+        }
 
     @staticmethod
     def _grid_shape(n: int) -> Tuple[int, int]:
@@ -148,14 +159,29 @@ class Layout2D:
                 for i in range(0, len(occupied) - 1, 2):
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
-                sim_cache: Dict[Tuple[int, int], float] = {}
-                for ia, yxa, ib, yxb in pairs:
-                    e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
-                            self._local_energy(yxb, ib, R, sim_cache)
-                    override = ((yxa, ib), (yxb, ia))
-                    e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
-                            self._local_energy(yxb, ia, R, sim_cache, override=override)
+                energies: List[Tuple[float, float]] = []
+                worker_count = 0
+                if pairs:
+                    try:
+                        worker_count = mp.cpu_count() or 1
+                    except NotImplementedError:
+                        worker_count = 1
+                    worker_count = min(worker_count, len(pairs))
+                if worker_count > 1:
+                    snapshot = self._make_worker_snapshot(R)
+                    with mp.Pool(processes=worker_count, initializer=_init_energy_worker, initargs=(snapshot,)) as pool:
+                        energies = pool.map(_energy_for_pair, pairs)
+                else:
+                    sim_cache: Dict[Tuple[int, int], float] = {}
+                    for ia, yxa, ib, yxb in pairs:
+                        e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
+                                self._local_energy(yxb, ib, R, sim_cache)
+                        override = ((yxa, ib), (yxb, ia))
+                        e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
+                                self._local_energy(yxb, ia, R, sim_cache, override=override)
+                        energies.append((e_cur, e_swp))
 
+                for (ia, yxa, ib, yxb), (e_cur, e_swp) in zip(pairs, energies):
                     if phase == "far":
                         if e_swp + 1e-9 < e_cur:
                             self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
@@ -188,3 +214,75 @@ class Layout2D:
         mask_b = self._code_to_bitmask(b)
         inter = (mask_a & mask_b).bit_count()
         return inter / math.sqrt(len(a) * len(b))
+
+
+_ENERGY_WORKER_STATE: Dict[str, object] = {}
+
+
+def _init_energy_worker(snapshot: Dict[str, object]) -> None:
+    global _ENERGY_WORKER_STATE
+    _ENERGY_WORKER_STATE = {
+        "neighbors": snapshot["neighbors"],
+        "cell_owner_grid": snapshot["cell_owner_grid"],
+        "code_bitmasks": snapshot["code_bitmasks"],
+        "code_norms": snapshot["code_norms"],
+        "aux_vecs": snapshot["aux_vecs"],
+        "aux_weight": snapshot["aux_weight"],
+        "sim_cache": {},
+    }
+
+
+def _similarity_from_snapshot(ia: int, ib: int) -> float:
+    state = _ENERGY_WORKER_STATE
+    cache: Dict[Tuple[int, int], float] = state["sim_cache"]  # type: ignore[assignment]
+    a, b = (ia, ib) if ia <= ib else (ib, ia)
+    cached = cache.get((a, b))
+    if cached is not None:
+        return cached
+    code_bitmasks: Sequence[int] = state["code_bitmasks"]  # type: ignore[assignment]
+    code_norms: Sequence[float] = state["code_norms"]  # type: ignore[assignment]
+    denom = code_norms[a] * code_norms[b]
+    if denom == 0.0:
+        sim = 0.0
+    else:
+        inter = (code_bitmasks[a] & code_bitmasks[b]).bit_count()
+        sim = inter / denom
+    aux_vecs = state["aux_vecs"]  # type: ignore[assignment]
+    aux_weight: float = state["aux_weight"]  # type: ignore[assignment]
+    if aux_vecs is not None and aux_weight > 0.0:
+        va = aux_vecs[a]
+        vb = aux_vecs[b]
+        if va is not None and vb is not None:
+            dot = sum(ax * bx for ax, bx in zip(va, vb))
+            sim += aux_weight * ((dot + 1.0) * 0.5)
+    cache[(a, b)] = sim
+    return sim
+
+
+def _local_energy_from_snapshot(yx: Tuple[int, int], center_idx: Optional[int], override: Optional[Dict[Tuple[int, int], Optional[int]]] = None) -> float:
+    state = _ENERGY_WORKER_STATE
+    if override:
+        ci = override.get(yx, center_idx)
+    else:
+        ci = center_idx
+    if ci is None:
+        return 0.0
+    neighbors: Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]] = state["neighbors"]  # type: ignore[assignment]
+    cell_owner_grid: Sequence[Sequence[Optional[int]]] = state["cell_owner_grid"]  # type: ignore[assignment]
+    energy = 0.0
+    for (ny, nx), dist in neighbors[yx]:
+        jdx = cell_owner_grid[ny][nx]
+        if override and (ny, nx) in override:
+            jdx = override[(ny, nx)]
+        if jdx is None:
+            continue
+        energy += _similarity_from_snapshot(ci, jdx) * dist
+    return energy
+
+
+def _energy_for_pair(pair: Tuple[int, Tuple[int, int], int, Tuple[int, int]]) -> Tuple[float, float]:
+    ia, yxa, ib, yxb = pair
+    override = {yxa: ib, yxb: ia}
+    e_cur = _local_energy_from_snapshot(yxa, ia) + _local_energy_from_snapshot(yxb, ib)
+    e_swp = _local_energy_from_snapshot(yxa, ib, override=override) + _local_energy_from_snapshot(yxb, ia, override=override)
+    return e_cur, e_swp

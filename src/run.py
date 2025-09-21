@@ -146,7 +146,7 @@ def run() -> None:
     enc.print_keyhole_records(True)
 
     lay = Layout2D(
-        R_far=64, epochs_far=200,
+        R_far=64, epochs_far=10,
         R_near=3, epochs_near=0,
         seed=123
     )
@@ -163,6 +163,11 @@ def run() -> None:
 
 
     print("RKS layout complete!")
+    rr.log("log/summary/encoder", rr.TextLog(f"bits: {enc.B}", level=rr.TextLogLevel.INFO))
+    rr.log("log/summary/encoder", rr.TextLog(f"keyhole_size: {enc.S}", level=rr.TextLogLevel.INFO))
+    rr.log("log/summary/encoder", rr.TextLog(f"keyholes_per_img: {enc.K}", level=rr.TextLogLevel.INFO))
+    rr.log("log/summary/layout", rr.TextLog(f"R_far: {lay.R_far}, epochs_far: {lay.E_far}", level=rr.TextLogLevel.INFO))
+    rr.log("log/summary/layout", rr.TextLog(f"R_near: {lay.R_near}, epochs_near: {lay.E_near}", level=rr.TextLogLevel.INFO))
 
 
 if __name__ == "__main__":

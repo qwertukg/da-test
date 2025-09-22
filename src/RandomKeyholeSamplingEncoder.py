@@ -1,9 +1,18 @@
 import random
 import math
 import hashlib
+from dataclasses import dataclass
 from typing import Optional, Dict, List, Set, Tuple
 
 import numpy as np
+
+
+@dataclass
+class KeyholeRecord:
+    angle: float
+    code: Set[int]
+    offset_id: int
+    keyhole_idx: int
 
 
 class RandomKeyholeSamplingEncoder:
@@ -24,6 +33,10 @@ class RandomKeyholeSamplingEncoder:
                  detectors_per_layer: Optional[List[int]] = None,
                  # --- сколько бит выдает один детектор ---
                  bits_per_detector: int = 4,
+                 # --- копии угловых кодов ---
+                 angle_code_copies: int = 2,
+                 angle_code_offset_density: float = 0.4,
+                 angle_code_max_overlap: float = 0.15,
                  # --- отбор «неплоских» скважин ---
                  mag_eps: float = 0.03,
                  min_active_frac: float = 0.05,
@@ -56,6 +69,16 @@ class RandomKeyholeSamplingEncoder:
 
         self.bits_per_detector = int(bits_per_detector)
 
+        self.angle_code_copies = max(0, int(angle_code_copies))
+        self.angle_code_offset_density = float(angle_code_offset_density)
+        self.angle_code_max_overlap = float(angle_code_max_overlap)
+        # плотные смещения выступают позиционными кодами (см. подход в DAML.pdf)
+        if self.angle_code_copies > 0:
+            if not (0.0 < self.angle_code_offset_density <= 1.0):
+                raise ValueError("angle_code_offset_density должен быть в (0, 1]")
+            if not (0.0 <= self.angle_code_max_overlap < 1.0):
+                raise ValueError("angle_code_max_overlap должен быть в [0, 1)")
+
         # отбор «неплоских»
         self.mag_eps = float(mag_eps)
         self.min_active_frac = float(min_active_frac)
@@ -70,13 +93,15 @@ class RandomKeyholeSamplingEncoder:
         # слои детекторов (центры и закреплённые за ними биты)
         self._layers: List[Dict[str, object]] = []
         self._build_angle_layers()
+        self._angle_offset_codes: List[Set[int]] = []
+        self._build_angle_offsets()
 
         # отладочная инфа по битам (угол)
         self.bit2info: Dict[int, Dict[str, float]] = {}
 
-        # --- НОВОЕ: сюда пишем по каждой скважине (angle, code) ---
+        # --- НОВОЕ: сюда пишем по каждой скважине и копии (angle, code, offset_id, keyhole_idx) ---
         # После каждого encode() список перезаписывается заново.
-        self.keyhole_records: List[Tuple[float, Set[int]]] = []
+        self.keyhole_records: List[KeyholeRecord] = []
         # --- метка текущего изображения ---
         self.current_img_label: Optional[object] = None
 
@@ -84,8 +109,9 @@ class RandomKeyholeSamplingEncoder:
 
     def encode(self, img: np.ndarray, label: Optional[object] = None) -> List[Set[int]]:
         """
-        Кодирует изображение в СПИСОК кодов скважин (1 скважина -> 1 код).
-        Также заполняет self.keyhole_records списком (angle, code)
+        Кодирует изображение в список кодов скважин.
+        Для каждой скважины формируются копии с различными плотными смещениями.
+        Также заполняет self.keyhole_records структурой (angle, code, offset_id, keyhole_idx)
         и сохраняет метку изображения, если она передана.
         """
         H, W = img.shape
@@ -110,21 +136,40 @@ class RandomKeyholeSamplingEncoder:
 
         # 4) По скважине — код (только от угла)
         codes_per_keyhole: List[Set[int]] = []
-        for (cy, cx) in centers:
+        for keyhole_local_idx, (cy, cx) in enumerate(centers):
             y0, y1, x0, x1 = self._window_bounds(cy, cx, H, W)
             tile_m = mnorm[y0:y1, x0:x1]
             tile_a = ang[y0:y1, x0:x1]
 
             angle = self._dominant_angle(tile_a, tile_m)  # [0, 2π)
-            bits_set: Set[int] = set(self._angle_bits_per_layer(angle))
+            base_bits: Set[int] = set(self._angle_bits_per_layer(angle))
 
-            for bit in bits_set:
+            for bit in base_bits:
                 self.bit2info.setdefault(int(bit), {"angle": float(angle)})
 
-            # --- НОВОЕ: накапливаем в поле класса ---
-            self.keyhole_records.append((float(angle), bits_set))
-
-            codes_per_keyhole.append(bits_set)
+            if self._angle_offset_codes:
+                for offset_id, offset_bits in enumerate(self._angle_offset_codes):
+                    code_bits = set(base_bits)
+                    code_bits.update(offset_bits)
+                    self.keyhole_records.append(
+                        KeyholeRecord(
+                            angle=float(angle),
+                            code=code_bits,
+                            offset_id=int(offset_id),
+                            keyhole_idx=int(keyhole_local_idx),
+                        )
+                    )
+                    codes_per_keyhole.append(code_bits)
+            else:
+                self.keyhole_records.append(
+                    KeyholeRecord(
+                        angle=float(angle),
+                        code=base_bits,
+                        offset_id=0,
+                        keyhole_idx=int(keyhole_local_idx),
+                    )
+                )
+                codes_per_keyhole.append(base_bits)
 
         return codes_per_keyhole
 
@@ -138,13 +183,13 @@ class RandomKeyholeSamplingEncoder:
             return
 
         # сортировка по возрастанию угла
-        recs = sorted(self.keyhole_records, key=lambda t: t[0])
+        recs = sorted(self.keyhole_records, key=lambda r: (r.angle, r.keyhole_idx, r.offset_id))
 
         label_repr = self.current_img_label if self.current_img_label is not None else "(метка не задана)"
         print(f"Метка класса: {label_repr}")
 
         prev_code: Optional[Set[int]] = None
-        first_code: Optional[Set[int]] = recs[0][1] if recs else None
+        first_code: Optional[Set[int]] = recs[0].code if recs else None
         total_recs = len(recs)
 
         def _print_overlap(prefix: str, code_a: Set[int], code_b: Set[int]) -> None:
@@ -163,7 +208,9 @@ class RandomKeyholeSamplingEncoder:
 
             print(f"∩ {prefix}: {overlap_pct:6.2f}% ({shared}/{union} бит); cos: {(cosine_val*100):6.2f}%")
 
-        for idx, (ang, code) in enumerate(recs):
+        for idx, rec in enumerate(recs):
+            ang = rec.angle
+            code = rec.code
             if prev_code is not None:
                 _print_overlap("с предыдущим", prev_code, code)
 
@@ -173,7 +220,9 @@ class RandomKeyholeSamplingEncoder:
             else:
                 inds = sorted(int(b) for b in code)
                 s = f"indices={inds}"
-            print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
+            print(
+                f"{ang:.6f} rad ({deg:7.2f}°) [скважина {rec.keyhole_idx}, копия {rec.offset_id}]: {s}"
+            )
             if idx == total_recs - 1 and first_code is not None and total_recs > 1:
                 _print_overlap("с первым", code, first_code)
             prev_code = code
@@ -272,6 +321,33 @@ class RandomKeyholeSamplingEncoder:
                         for j in range(n)]
             self._layers.append({"n": n, "width": width, "mu": mus, "bits": bits_tbl})
 
+    def _build_angle_offsets(self) -> None:
+        """Формирует плотные смещения кодов для копий углов."""
+        self._angle_offset_codes = []
+        if self.angle_code_copies <= 0:
+            return
+
+        rng = random.Random(self.seed ^ 0xBEEF)
+        target_size = min(self.B, max(1, int(round(self.B * self.angle_code_offset_density))))
+
+        for _ in range(self.angle_code_copies):
+            accepted = False
+            attempts = 0
+            candidate: Set[int] = set()
+            while not accepted and attempts < 256:
+                attempts += 1
+                candidate = self._make_dense_offset_code(rng, target_size)
+                overlaps_ok = True
+                for prev in self._angle_offset_codes:
+                    if self._offset_overlap(candidate, prev) > self.angle_code_max_overlap:
+                        overlaps_ok = False
+                        break
+                if overlaps_ok:
+                    accepted = True
+            if not accepted:
+                candidate = self._make_dense_offset_code(rng, target_size)
+            self._angle_offset_codes.append(candidate)
+
     @staticmethod
     def _circ_delta(a: float, b: float) -> float:
         """Минимальная круговая разность углов (0..π]."""
@@ -282,6 +358,18 @@ class RandomKeyholeSamplingEncoder:
         h = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=16).digest(), 'little')
         step = 0x9E3779B97F4A7C15
         return [int((h + i * step) % self.B) for i in range(k)]
+
+    def _make_dense_offset_code(self, rng: random.Random, size: int) -> Set[int]:
+        bits: Set[int] = set()
+        while len(bits) < size:
+            bits.add(rng.randrange(self.B))
+        return bits
+
+    @staticmethod
+    def _offset_overlap(a: Set[int], b: Set[int]) -> float:
+        if not a or not b:
+            return 0.0
+        return len(a & b) / float(min(len(a), len(b)))
 
     def _angle_bits_per_layer(self, angle: float) -> List[int]:
         """
@@ -341,3 +429,4 @@ class RandomKeyholeSamplingEncoder:
         angle = float(np.angle(vec_sum) % (2 * np.pi))
         selectivity = float(abs(vec_sum) / len(vectors))
         return angle, selectivity
+

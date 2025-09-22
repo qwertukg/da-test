@@ -56,10 +56,13 @@ def rr_log_layout_ang(
     tag: str = "layout",
     step: int = 0,
     angles: Optional[List[float]] = None,
+    offset_ids: Optional[List[int]] = None,
 ):
     N = len(codes)
     if angles is not None and len(angles) != N:
         raise ValueError("длина angles должна совпадать с числом кодов")
+    if offset_ids is not None and len(offset_ids) != N:
+        raise ValueError("длина offset_ids должна совпадать с числом кодов")
     pos = np.zeros((N, 2), dtype=np.float32)
     col = np.zeros((N, 3), dtype=np.uint8)
     labels: List[str] = []
@@ -72,7 +75,10 @@ def rr_log_layout_ang(
             angle, _ = enc.code_dominant_orientation(code)
         col[i] = np.array(rgb_from_angle(angle), dtype=np.uint8)
         angle_deg = np.degrees(angle)
-        labels.append(f"{angle_deg:.2f}°")
+        suffix = ""
+        if offset_ids is not None:
+            suffix = f" · копия {offset_ids[i]}"
+        labels.append(f"{angle_deg:.2f}°{suffix}")
     timeline_step = step
     if isinstance(tag, str):
         phase_name = tag.rsplit("/", 1)[-1]
@@ -97,6 +103,11 @@ def rr_log_layout_ang(
 def run() -> None:
     rr_init("rkse+layout", spawn=True)
 
+    keyhole_codes_train: List[Set[int]] = []
+    keyhole_angles_train: List[float] = []
+    keyhole_offset_ids_train: List[int] = []
+    keyhole_meta_train: List[Tuple[int, int, int, float]] = []
+
     def on_epoch_dots(phase, ep, lay):
         rr_log_layout_ang(
             lay,
@@ -105,6 +116,7 @@ def run() -> None:
             tag=f"layout/{phase}",
             step=ep,
             angles=keyhole_angles_train,
+            offset_ids=keyhole_offset_ids_train,
         )
 
 
@@ -128,20 +140,17 @@ def run() -> None:
         adaptive_fill=True, adaptive_decay=0.5,
     )
 
-    keyhole_codes_train: List[Set[int]] = []
-    keyhole_meta_train: List[Tuple[int, int, float]] = []
-
     for img_idx, img in enumerate(X_train):
         enc_codes = enc.encode(img, label=y_train[img_idx])
         if len(enc_codes) != len(enc.keyhole_records):
             raise RuntimeError(
                 "encode() должен заполнять keyhole_records для каждой скважины"
             )
-        for keyhole_idx, (angle, code) in enumerate(enc.keyhole_records):
-            keyhole_codes_train.append(code)
-            keyhole_meta_train.append((img_idx, keyhole_idx, angle))
-
-    keyhole_angles_train: List[float] = [meta[2] for meta in keyhole_meta_train]
+        for record in enc.keyhole_records:
+            keyhole_codes_train.append(set(record.code))
+            keyhole_angles_train.append(record.angle)
+            keyhole_offset_ids_train.append(record.offset_id)
+            keyhole_meta_train.append((img_idx, record.keyhole_idx, record.offset_id, record.angle))
 
     enc.print_keyhole_records(True)
 

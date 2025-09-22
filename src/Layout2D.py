@@ -1,5 +1,7 @@
 import math
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
@@ -44,9 +46,17 @@ class Layout2D:
                     return idx
         return default_idx
 
-    def _similarity(self, ia: int, ib: int, cache: Dict[Tuple[int, int], float]) -> float:
+    def _similarity(self,
+                    ia: int,
+                    ib: int,
+                    cache: Dict[Tuple[int, int], float],
+                    lock: Optional[threading.Lock]) -> float:
         a, b = (ia, ib) if ia <= ib else (ib, ia)
-        cached = cache.get((a, b))
+        if lock is None:
+            cached = cache.get((a, b))
+        else:
+            with lock:
+                cached = cache.get((a, b))
         if cached is not None:
             return cached
         denom = self._code_norms[a] * self._code_norms[b]
@@ -61,10 +71,20 @@ class Layout2D:
             if va is not None and vb is not None:
                 dot = sum(ax * bx for ax, bx in zip(va, vb))
                 sim += self._aux_weight * ((dot + 1.0) * 0.5)
-        cache[(a, b)] = sim
+        if lock is None:
+            cache[(a, b)] = sim
+        else:
+            with lock:
+                cache[(a, b)] = sim
         return sim
 
-    def _local_energy(self, yx, center_idx, R, sim_cache, override=None) -> float:
+    def _local_energy(self,
+                      yx,
+                      center_idx,
+                      R,
+                      sim_cache,
+                      cache_lock,
+                      override=None) -> float:
         ci = self._resolve_override(yx, center_idx, override)
         if ci is None:
             return 0.0
@@ -73,8 +93,22 @@ class Layout2D:
             jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
             if jdx is None:
                 continue
-            energy += self._similarity(ci, jdx, sim_cache) * dist
+            energy += self._similarity(ci, jdx, sim_cache, cache_lock) * dist
         return energy
+
+    def _pair_energy(self,
+                     left_yx,
+                     left_idx,
+                     right_yx,
+                     right_idx,
+                     R,
+                     sim_cache,
+                     cache_lock,
+                     override=None) -> float:
+        return (
+            self._local_energy(left_yx, left_idx, R, sim_cache, cache_lock, override=override)
+            + self._local_energy(right_yx, right_idx, R, sim_cache, cache_lock, override=override)
+        )
 
     def _prepare_neighbors(self, radii: Iterable[int]) -> None:
         H, W = self.shape
@@ -149,25 +183,32 @@ class Layout2D:
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
                 sim_cache: Dict[Tuple[int, int], float] = {}
-                for ia, yxa, ib, yxb in pairs:
-                    e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
-                            self._local_energy(yxb, ib, R, sim_cache)
-                    override = ((yxa, ib), (yxb, ia))
-                    e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
-                            self._local_energy(yxb, ia, R, sim_cache, override=override)
+                cache_lock = threading.Lock()
+                with ThreadPoolExecutor() as pool:
+                    for ia, yxa, ib, yxb in pairs:
+                        override = ((yxa, ib), (yxb, ia))
+                        future_cur = pool.submit(self._pair_energy,
+                                                 yxa, ia, yxb, ib, R,
+                                                 sim_cache, cache_lock)
+                        future_swp = pool.submit(self._pair_energy,
+                                                  yxa, ib, yxb, ia, R,
+                                                  sim_cache, cache_lock,
+                                                  override=override)
+                        e_cur = future_cur.result()
+                        e_swp = future_swp.result()
 
-                    if phase == "far":
-                        if e_swp + 1e-9 < e_cur:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if on_swap: on_swap(yxa, yxb, phase, ep, self)
-                    else:
-                        if e_swp > e_cur + 1e-9:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                        if phase == "far":
+                            if e_swp + 1e-9 < e_cur:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                        else:
+                            if e_swp > e_cur + 1e-9:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
 
                 if on_epoch: on_epoch(phase, ep, self)
 

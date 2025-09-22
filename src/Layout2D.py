@@ -49,8 +49,18 @@ class Layout2D:
     def _similarity(self,
                     ia: int,
                     ib: int,
-                    cache: Dict[Tuple[int, int], float],
-                    lock: Optional[threading.Lock]) -> float:
+                    cache: Optional[Dict[Tuple[int, int], float]],
+                    lock: Optional[threading.Lock],
+                    thread_local_cache: Optional[threading.local] = None) -> float:
+        if cache is None and thread_local_cache is not None:
+            local_cache = getattr(thread_local_cache, "sim_cache", None)
+            if local_cache is None:
+                local_cache = {}
+                thread_local_cache.sim_cache = local_cache
+            cache = local_cache
+            lock = None
+        if cache is None:
+            raise RuntimeError("не удалось инициализировать кэш сходства для DAML")
         a, b = (ia, ib) if ia <= ib else (ib, ia)
         if lock is None:
             cached = cache.get((a, b))
@@ -82,8 +92,9 @@ class Layout2D:
                       yx,
                       center_idx,
                       R,
-                      sim_cache,
-                      cache_lock,
+                      sim_cache: Optional[Dict[Tuple[int, int], float]],
+                      cache_lock: Optional[threading.Lock],
+                      thread_local_cache: Optional[threading.local] = None,
                       override=None) -> float:
         ci = self._resolve_override(yx, center_idx, override)
         if ci is None:
@@ -93,7 +104,7 @@ class Layout2D:
             jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
             if jdx is None:
                 continue
-            energy += self._similarity(ci, jdx, sim_cache, cache_lock) * dist
+            energy += self._similarity(ci, jdx, sim_cache, cache_lock, thread_local_cache) * dist
         return energy
 
     def _pair_energy(self,
@@ -101,13 +112,14 @@ class Layout2D:
                      left_idx,
                      right_yx,
                      right_idx,
-                     R,
-                     sim_cache,
-                     cache_lock,
+                      R,
+                     sim_cache: Optional[Dict[Tuple[int, int], float]],
+                     cache_lock: Optional[threading.Lock],
+                     thread_local_cache: Optional[threading.local] = None,
                      override=None) -> float:
         return (
-            self._local_energy(left_yx, left_idx, R, sim_cache, cache_lock, override=override)
-            + self._local_energy(right_yx, right_idx, R, sim_cache, cache_lock, override=override)
+            self._local_energy(left_yx, left_idx, R, sim_cache, cache_lock, thread_local_cache, override=override)
+            + self._local_energy(right_yx, right_idx, R, sim_cache, cache_lock, thread_local_cache, override=override)
         )
 
     def _prepare_neighbors(self, radii: Iterable[int]) -> None:
@@ -175,23 +187,26 @@ class Layout2D:
             self._cell_owner_grid[yx[0]][yx[1]] = i
 
         executor: Optional[ThreadPoolExecutor] = None
+        thread_local = threading.local()  # отдельные кэши по потокам убирают критическую секцию DAML
         if len(cells) > 1:
             executor = ThreadPoolExecutor()
 
-        def evaluate_pair(ia, yxa, ib, yxb, radius, sim_cache, cache_lock):
+        def evaluate_pair(ia, yxa, ib, yxb, radius, sim_cache, cache_lock, thread_local_cache=None):
             override = ((yxa, ib), (yxb, ia))
             e_cur = self._pair_energy(
                 yxa, ia, yxb, ib, radius,
-                sim_cache, cache_lock
+                sim_cache, cache_lock, thread_local_cache
             )
             e_swp = self._pair_energy(
                 yxa, ib, yxb, ia, radius,
                 sim_cache, cache_lock,
+                thread_local_cache,
                 override=override
             )
             return ia, yxa, ib, yxb, e_cur, e_swp
 
         def pass_epoch(R: int, iters: int, phase: str):
+            shared_cache: Dict[Tuple[int, int], float] = {}
             for ep in range(iters):
                 occupied = list(self.idx2cell.items());
                 self.rng.shuffle(occupied)
@@ -199,9 +214,11 @@ class Layout2D:
                 for i in range(0, len(occupied) - 1, 2):
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
-                sim_cache: Dict[Tuple[int, int], float] = {}
                 use_parallel = executor is not None and len(pairs) > 1
-                cache_lock = threading.Lock() if use_parallel else None
+                if not use_parallel:
+                    shared_cache.clear()
+                sim_cache = None if use_parallel else shared_cache
+                cache_lock = None
                 if not pairs:
                     if on_epoch: on_epoch(phase, ep, self)
                     continue
@@ -223,9 +240,10 @@ class Layout2D:
                                 self._cell_owner_grid[yxb[0]][yxb[1]] = ia
                                 if on_swap: on_swap(yxa, yxb, phase, ep, self)
                 else:
+                    # параллельный режим использует локальные кэши и не требует общего лока
                     futures = [
                         executor.submit(
-                            evaluate_pair, ia, yxa, ib, yxb, R, sim_cache, cache_lock
+                            evaluate_pair, ia, yxa, ib, yxb, R, None, None, thread_local
                         )
                         for ia, yxa, ib, yxb in pairs
                     ]

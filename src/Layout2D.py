@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -10,9 +11,13 @@ WorkerState = Tuple[
     float,
 ]
 
+CacheToken = Tuple[str, int, int]
+
 NeighborInfo = Sequence[Tuple[Tuple[int, int], float, Optional[int]]]
 
 _WORKER_STATE: WorkerState = ((), (), None, 0.0)
+_WORKER_SIM_CACHE: Dict[Tuple[int, int], float] = {}
+_WORKER_CACHE_TOKEN: Optional[CacheToken] = None
 
 
 def _init_worker_state(
@@ -21,8 +26,10 @@ def _init_worker_state(
     aux_vecs: Optional[Sequence[Optional[Tuple[float, ...]]]],
     aux_weight: float,
 ) -> None:
-    global _WORKER_STATE
+    global _WORKER_STATE, _WORKER_SIM_CACHE, _WORKER_CACHE_TOKEN
     _WORKER_STATE = (code_bitmasks, code_norms, aux_vecs, aux_weight)
+    _WORKER_SIM_CACHE = {}
+    _WORKER_CACHE_TOKEN = None
 
 
 def _compute_similarity(idx_a: int, idx_b: int, state: WorkerState) -> float:
@@ -107,9 +114,14 @@ def evaluate_pair_worker(
         Tuple[int, int],
         NeighborInfo,
         NeighborInfo,
+        CacheToken,
     ]
 ) -> Tuple[int, Tuple[int, int], int, Tuple[int, int], float, float]:
-    ia, yxa, ib, yxb, neighbors_a, neighbors_b = task
+    global _WORKER_CACHE_TOKEN
+    ia, yxa, ib, yxb, neighbors_a, neighbors_b, cache_token = task
+    if cache_token != _WORKER_CACHE_TOKEN:
+        _WORKER_SIM_CACHE.clear()
+        _WORKER_CACHE_TOKEN = cache_token
     return _evaluate_pair_core(
         ia,
         yxa,
@@ -118,7 +130,7 @@ def evaluate_pair_worker(
         neighbors_a,
         neighbors_b,
         state=None,
-        sim_cache=None,
+        sim_cache=_WORKER_SIM_CACHE,
     )
 
 
@@ -282,8 +294,11 @@ class Layout2D:
             self._cell_owner_grid[yx[0]][yx[1]] = i
 
         executor: Optional[ProcessPoolExecutor] = None
+        worker_count = 0
         if len(cells) > 1:
+            worker_count = min(os.cpu_count() or 1, len(cells))
             executor = ProcessPoolExecutor(
+                max_workers=worker_count,
                 initializer=_init_worker_state,
                 initargs=(
                     self._code_bitmasks,
@@ -346,6 +361,7 @@ class Layout2D:
                                 self._cell_owner_grid[yxb[0]][yxb[1]] = ia
                                 if on_swap: on_swap(yxa, yxb, phase, ep, self)
                 else:
+                    cache_token: CacheToken = (phase, ep, R)
                     tasks = []
                     for ia, yxa, ib, yxb in pairs:
                         neighbors_a: NeighborInfo = tuple(
@@ -356,9 +372,25 @@ class Layout2D:
                             ((ny, nx), dist, self._cell_owner_grid[ny][nx])
                             for (ny, nx), dist in self._neighbors(yxb[0], yxb[1], R)
                         )
-                        tasks.append((ia, yxa, ib, yxb, neighbors_a, neighbors_b))
+                        tasks.append(
+                            (
+                                ia,
+                                yxa,
+                                ib,
+                                yxb,
+                                neighbors_a,
+                                neighbors_b,
+                                cache_token,
+                            )
+                        )
+                    if worker_count:
+                        chunk = max(1, len(tasks) // (worker_count * 4))
+                    else:
+                        chunk = 1
                     for ia, yxa, ib, yxb, e_cur, e_swp in executor.map(
-                        evaluate_pair_worker, tasks
+                        evaluate_pair_worker,
+                        tasks,
+                        chunksize=chunk,
                     ):
                         if phase == "far":
                             if e_swp + 1e-9 < e_cur:

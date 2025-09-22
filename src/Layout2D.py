@@ -1,8 +1,125 @@
 import math
 import random
-import threading
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+WorkerState = Tuple[
+    Sequence[int],
+    Sequence[float],
+    Optional[Sequence[Optional[Tuple[float, ...]]]],
+    float,
+]
+
+NeighborInfo = Sequence[Tuple[Tuple[int, int], float, Optional[int]]]
+
+_WORKER_STATE: WorkerState = ((), (), None, 0.0)
+
+
+def _init_worker_state(
+    code_bitmasks: Sequence[int],
+    code_norms: Sequence[float],
+    aux_vecs: Optional[Sequence[Optional[Tuple[float, ...]]]],
+    aux_weight: float,
+) -> None:
+    global _WORKER_STATE
+    _WORKER_STATE = (code_bitmasks, code_norms, aux_vecs, aux_weight)
+
+
+def _compute_similarity(idx_a: int, idx_b: int, state: WorkerState) -> float:
+    code_bitmasks, code_norms, aux_vecs, aux_weight = state
+    a, b = (idx_a, idx_b) if idx_a <= idx_b else (idx_b, idx_a)
+    denom = code_norms[a] * code_norms[b]
+    if denom == 0.0:
+        sim = 0.0
+    else:
+        inter = (code_bitmasks[a] & code_bitmasks[b]).bit_count()
+        sim = inter / denom
+    if aux_vecs is not None and aux_weight > 0.0:
+        va = aux_vecs[a]
+        vb = aux_vecs[b]
+        if va is not None and vb is not None:
+            dot = sum(ax * bx for ax, bx in zip(va, vb))
+            sim += aux_weight * ((dot + 1.0) * 0.5)
+    return sim
+
+
+def _evaluate_pair_core(
+    ia: int,
+    yxa: Tuple[int, int],
+    ib: int,
+    yxb: Tuple[int, int],
+    neighbors_a: NeighborInfo,
+    neighbors_b: NeighborInfo,
+    state: Optional[WorkerState] = None,
+    sim_cache: Optional[Dict[Tuple[int, int], float]] = None,
+) -> Tuple[int, Tuple[int, int], int, Tuple[int, int], float, float]:
+    if state is None:
+        state = _WORKER_STATE
+
+    def similarity(idx1: int, idx2: int) -> float:
+        key = (idx1, idx2) if idx1 <= idx2 else (idx2, idx1)
+        if sim_cache is not None:
+            cached = sim_cache.get(key)
+            if cached is not None:
+                return cached
+        value = _compute_similarity(idx1, idx2, state)
+        if sim_cache is not None:
+            sim_cache[key] = value
+        return value
+
+    def local_energy(
+        center_idx: int,
+        neighbors: NeighborInfo,
+        overrides: Dict[Tuple[int, int], Optional[int]],
+    ) -> float:
+        energy = 0.0
+        for cell_coord, dist, neighbor_idx in neighbors:
+            idx = overrides.get(cell_coord, neighbor_idx)
+            if idx is None:
+                continue
+            energy += similarity(center_idx, idx) * dist
+        return energy
+
+    overrides_left: Dict[Tuple[int, int], Optional[int]] = {}
+    overrides_right: Dict[Tuple[int, int], Optional[int]] = {}
+
+    current = (
+        local_energy(ia, neighbors_a, overrides_left)
+        + local_energy(ib, neighbors_b, overrides_right)
+    )
+
+    overrides_left[yxb] = ia
+    overrides_right[yxa] = ib
+
+    swapped = (
+        local_energy(ib, neighbors_a, overrides_left)
+        + local_energy(ia, neighbors_b, overrides_right)
+    )
+
+    return ia, yxa, ib, yxb, current, swapped
+
+
+def evaluate_pair_worker(
+    task: Tuple[
+        int,
+        Tuple[int, int],
+        int,
+        Tuple[int, int],
+        NeighborInfo,
+        NeighborInfo,
+    ]
+) -> Tuple[int, Tuple[int, int], int, Tuple[int, int], float, float]:
+    ia, yxa, ib, yxb, neighbors_a, neighbors_b = task
+    return _evaluate_pair_core(
+        ia,
+        yxa,
+        ib,
+        yxb,
+        neighbors_a,
+        neighbors_b,
+        state=None,
+        sim_cache=None,
+    )
 
 
 class Layout2D:
@@ -46,45 +163,36 @@ class Layout2D:
                     return idx
         return default_idx
 
-    def _similarity(self,
-                    ia: int,
-                    ib: int,
-                    cache: Dict[Tuple[int, int], float],
-                    lock: Optional[threading.Lock]) -> float:
-        a, b = (ia, ib) if ia <= ib else (ib, ia)
-        if lock is None:
-            cached = cache.get((a, b))
-        else:
-            with lock:
-                cached = cache.get((a, b))
-        if cached is not None:
-            return cached
-        denom = self._code_norms[a] * self._code_norms[b]
-        if denom == 0.0:
-            sim = 0.0
-        else:
-            inter = (self._code_bitmasks[a] & self._code_bitmasks[b]).bit_count()
-            sim = inter / denom
-        if self._aux_vecs is not None and self._aux_weight > 0.0:
-            va = self._aux_vecs[a]
-            vb = self._aux_vecs[b]
-            if va is not None and vb is not None:
-                dot = sum(ax * bx for ax, bx in zip(va, vb))
-                sim += self._aux_weight * ((dot + 1.0) * 0.5)
-        if lock is None:
-            cache[(a, b)] = sim
-        else:
-            with lock:
-                cache[(a, b)] = sim
-        return sim
+    def _similarity(
+        self,
+        ia: int,
+        ib: int,
+        cache: Optional[Dict[Tuple[int, int], float]] = None,
+    ) -> float:
+        state: WorkerState = (
+            self._code_bitmasks,
+            self._code_norms,
+            self._aux_vecs,
+            self._aux_weight,
+        )
+        key = (ia, ib) if ia <= ib else (ib, ia)
+        if cache is not None:
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+        value = _compute_similarity(ia, ib, state)
+        if cache is not None:
+            cache[key] = value
+        return value
 
-    def _local_energy(self,
-                      yx,
-                      center_idx,
-                      R,
-                      sim_cache,
-                      cache_lock,
-                      override=None) -> float:
+    def _local_energy(
+        self,
+        yx: Tuple[int, int],
+        center_idx: Optional[int],
+        R: int,
+        sim_cache: Optional[Dict[Tuple[int, int], float]],
+        override=None,
+    ) -> float:
         ci = self._resolve_override(yx, center_idx, override)
         if ci is None:
             return 0.0
@@ -93,21 +201,20 @@ class Layout2D:
             jdx = self._resolve_override((ny, nx), self._cell_owner_grid[ny][nx], override)
             if jdx is None:
                 continue
-            energy += self._similarity(ci, jdx, sim_cache, cache_lock) * dist
+            energy += self._similarity(ci, jdx, sim_cache) * dist
         return energy
 
     def _pair_energy(self,
-                     left_yx,
-                     left_idx,
-                     right_yx,
-                     right_idx,
-                     R,
-                     sim_cache,
-                     cache_lock,
+                     left_yx: Tuple[int, int],
+                     left_idx: Optional[int],
+                     right_yx: Tuple[int, int],
+                     right_idx: Optional[int],
+                     R: int,
+                     sim_cache: Optional[Dict[Tuple[int, int], float]],
                      override=None) -> float:
         return (
-            self._local_energy(left_yx, left_idx, R, sim_cache, cache_lock, override=override)
-            + self._local_energy(right_yx, right_idx, R, sim_cache, cache_lock, override=override)
+            self._local_energy(left_yx, left_idx, R, sim_cache, override=override)
+            + self._local_energy(right_yx, right_idx, R, sim_cache, override=override)
         )
 
     def _prepare_neighbors(self, radii: Iterable[int]) -> None:
@@ -174,22 +281,24 @@ class Layout2D:
             self.idx2cell[i] = yx;
             self._cell_owner_grid[yx[0]][yx[1]] = i
 
-        executor: Optional[ThreadPoolExecutor] = None
+        executor: Optional[ProcessPoolExecutor] = None
         if len(cells) > 1:
-            executor = ThreadPoolExecutor()
+            executor = ProcessPoolExecutor(
+                initializer=_init_worker_state,
+                initargs=(
+                    self._code_bitmasks,
+                    self._code_norms,
+                    self._aux_vecs,
+                    self._aux_weight,
+                ),
+            )
 
-        def evaluate_pair(ia, yxa, ib, yxb, radius, sim_cache, cache_lock):
-            override = ((yxa, ib), (yxb, ia))
-            e_cur = self._pair_energy(
-                yxa, ia, yxb, ib, radius,
-                sim_cache, cache_lock
-            )
-            e_swp = self._pair_energy(
-                yxa, ib, yxb, ia, radius,
-                sim_cache, cache_lock,
-                override=override
-            )
-            return ia, yxa, ib, yxb, e_cur, e_swp
+        state_for_local: WorkerState = (
+            self._code_bitmasks,
+            self._code_norms,
+            self._aux_vecs,
+            self._aux_weight,
+        )
 
         def pass_epoch(R: int, iters: int, phase: str):
             for ep in range(iters):
@@ -199,16 +308,30 @@ class Layout2D:
                 for i in range(0, len(occupied) - 1, 2):
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
-                sim_cache: Dict[Tuple[int, int], float] = {}
                 use_parallel = executor is not None and len(pairs) > 1
-                cache_lock = threading.Lock() if use_parallel else None
                 if not pairs:
                     if on_epoch: on_epoch(phase, ep, self)
                     continue
                 if not use_parallel:
+                    sim_cache: Dict[Tuple[int, int], float] = {}
                     for ia, yxa, ib, yxb in pairs:
-                        _, _, _, _, e_cur, e_swp = evaluate_pair(
-                            ia, yxa, ib, yxb, R, sim_cache, cache_lock
+                        neighbors_a: NeighborInfo = tuple(
+                            ((ny, nx), dist, self._cell_owner_grid[ny][nx])
+                            for (ny, nx), dist in self._neighbors(yxa[0], yxa[1], R)
+                        )
+                        neighbors_b: NeighborInfo = tuple(
+                            ((ny, nx), dist, self._cell_owner_grid[ny][nx])
+                            for (ny, nx), dist in self._neighbors(yxb[0], yxb[1], R)
+                        )
+                        _, _, _, _, e_cur, e_swp = _evaluate_pair_core(
+                            ia,
+                            yxa,
+                            ib,
+                            yxb,
+                            neighbors_a,
+                            neighbors_b,
+                            state=state_for_local,
+                            sim_cache=sim_cache,
                         )
                         if phase == "far":
                             if e_swp + 1e-9 < e_cur:
@@ -223,15 +346,20 @@ class Layout2D:
                                 self._cell_owner_grid[yxb[0]][yxb[1]] = ia
                                 if on_swap: on_swap(yxa, yxb, phase, ep, self)
                 else:
-                    futures = [
-                        executor.submit(
-                            evaluate_pair, ia, yxa, ib, yxb, R, sim_cache, cache_lock
+                    tasks = []
+                    for ia, yxa, ib, yxb in pairs:
+                        neighbors_a: NeighborInfo = tuple(
+                            ((ny, nx), dist, self._cell_owner_grid[ny][nx])
+                            for (ny, nx), dist in self._neighbors(yxa[0], yxa[1], R)
                         )
-                        for ia, yxa, ib, yxb in pairs
-                    ]
-                    wait(futures)
-                    for fut in futures:
-                        ia, yxa, ib, yxb, e_cur, e_swp = fut.result()
+                        neighbors_b: NeighborInfo = tuple(
+                            ((ny, nx), dist, self._cell_owner_grid[ny][nx])
+                            for (ny, nx), dist in self._neighbors(yxb[0], yxb[1], R)
+                        )
+                        tasks.append((ia, yxa, ib, yxb, neighbors_a, neighbors_b))
+                    for ia, yxa, ib, yxb, e_cur, e_swp in executor.map(
+                        evaluate_pair_worker, tasks
+                    ):
                         if phase == "far":
                             if e_swp + 1e-9 < e_cur:
                                 self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa

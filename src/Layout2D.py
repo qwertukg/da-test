@@ -1,11 +1,123 @@
 import math
+import os
 import random
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+_ENERGY_WORKER_CONTEXT: Optional[Dict[str, object]] = None
+_ENERGY_WORKER_TLS = threading.local()
+
+
+def _set_energy_context(context: Optional[Dict[str, object]]) -> None:
+    global _ENERGY_WORKER_CONTEXT
+    _ENERGY_WORKER_CONTEXT = context
+    if hasattr(_ENERGY_WORKER_TLS, "sim_cache"):
+        delattr(_ENERGY_WORKER_TLS, "sim_cache")
+
+
+def _init_energy_worker(context: Dict[str, object]) -> None:
+    _set_energy_context(context)
+
+
+def _energy_worker_cache() -> Dict[Tuple[int, int], float]:
+    cache = getattr(_ENERGY_WORKER_TLS, "sim_cache", None)
+    if cache is None:
+        cache = {}
+        _ENERGY_WORKER_TLS.sim_cache = cache
+    return cache
+
+
+def _resolve_override_worker(cell: Tuple[int, int], default_idx: Optional[int], override) -> Optional[int]:
+    if override:
+        for oyx, idx in override:
+            if oyx == cell:
+                return idx
+    return default_idx
+
+
+def _similarity_worker(ia: int, ib: int, cache: Dict[Tuple[int, int], float], context: Dict[str, object]) -> float:
+    if ia > ib:
+        ia, ib = ib, ia
+    key = (ia, ib)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    code_bitmasks = context["code_bitmasks"]
+    code_norms = context["code_norms"]
+    denom = code_norms[ia] * code_norms[ib]
+    if denom == 0.0:
+        sim = 0.0
+    else:
+        code_packed = context.get("code_packed")
+        if code_packed is not None:
+            np_mod = context["numpy"]
+            packed_inter = np_mod.bitwise_and(code_packed[ia], code_packed[ib])
+            inter = int(np_mod.bit_count(packed_inter).sum(dtype=np_mod.int64))
+        else:
+            inter = (code_bitmasks[ia] & code_bitmasks[ib]).bit_count()
+        sim = inter / denom
+    aux_vecs = context["aux_vecs"]
+    aux_weight = context["aux_weight"]
+    if aux_vecs is not None and aux_weight > 0.0:
+        va = aux_vecs[ia]
+        vb = aux_vecs[ib]
+        if va is not None and vb is not None:
+            dot = sum(ax * bx for ax, bx in zip(va, vb))
+            sim += aux_weight * ((dot + 1.0) * 0.5)
+    cache[key] = sim
+    return sim
+
+
+def _local_energy_worker(yx: Tuple[int, int], center_idx: Optional[int], R: int, override, context: Dict[str, object], cache: Dict[Tuple[int, int], float]) -> float:
+    if center_idx is None:
+        return 0.0
+    neighbors = context["neighbor_cache"][R][yx]
+    grid = context["grid"]
+    grid_array = context.get("grid_array")
+    energy = 0.0
+    for (ny, nx), dist in neighbors:
+        if grid_array is not None:
+            raw_idx = int(grid_array[ny, nx])
+        else:
+            raw_idx = grid[ny][nx]
+        if raw_idx == -1:
+            neighbor_idx = None
+        else:
+            neighbor_idx = raw_idx
+        jdx = _resolve_override_worker((ny, nx), neighbor_idx, override)
+        if jdx is None:
+            continue
+        energy += _similarity_worker(center_idx, jdx, cache, context) * dist
+    return energy
+
+
+def _compute_pair_energy_task(task: Tuple[int, Tuple[int, int], int, Tuple[int, int], int]) -> Tuple[int, Tuple[int, int], int, Tuple[int, int], float, float]:
+    if _ENERGY_WORKER_CONTEXT is None:
+        raise RuntimeError("Энергетический контекст не инициализирован")
+    ia, yxa, ib, yxb, R = task
+    cache = _energy_worker_cache()
+    context = _ENERGY_WORKER_CONTEXT
+    override = ((yxa, ib), (yxb, ia))
+    e_cur = (_local_energy_worker(yxa, ia, R, None, context, cache) +
+             _local_energy_worker(yxb, ib, R, None, context, cache))
+    e_swp = (_local_energy_worker(yxa, ib, R, override, context, cache) +
+             _local_energy_worker(yxb, ia, R, override, context, cache))
+    return ia, yxa, ib, yxb, e_cur, e_swp
 
 
 class Layout2D:
 
-    def __init__(self, R_far=7, R_near=3, epochs_far=8, epochs_near=6, seed=123):
+    def __init__(self,
+                 R_far=7,
+                 R_near=3,
+                 epochs_far=8,
+                 epochs_near=6,
+                 seed=123,
+                 energy_backend: str = "sequential",
+                 energy_workers: Optional[int] = None,
+                 energy_chunksize: int = 32):
         self.R_far = R_far
         self.R_near = R_near
         self.E_far = epochs_far
@@ -20,6 +132,14 @@ class Layout2D:
         self._neighbor_cache: Dict[int, Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]]] = {}
         self._aux_vecs: Optional[List[Optional[Tuple[float, ...]]]] = None
         self._aux_weight: float = 0.0
+        self._np = None
+        self._code_packed = None
+        backend = energy_backend.lower()
+        if backend not in {"sequential", "process", "thread"}:
+            raise ValueError("energy_backend должен быть 'sequential', 'process' или 'thread'")
+        self._energy_backend = backend
+        self._energy_workers = energy_workers
+        self._energy_chunksize = max(1, int(energy_chunksize))
 
     @staticmethod
     def _grid_shape(n: int) -> Tuple[int, int]:
@@ -101,6 +221,73 @@ class Layout2D:
                 cache_R[(y, x)] = neighbors
             self._neighbor_cache[R] = cache_R
 
+    def _effective_worker_count(self) -> int:
+        if self._energy_workers is not None and self._energy_workers > 0:
+            return int(self._energy_workers)
+        cpu_count = os.cpu_count() or 1
+        return max(1, cpu_count)
+
+    def _build_energy_context(self) -> Dict[str, object]:
+        grid_snapshot = tuple(
+            tuple(-1 if cell is None else cell for cell in row)
+            for row in self._cell_owner_grid
+        )
+        context: Dict[str, object] = {
+            "neighbor_cache": self._neighbor_cache,
+            "code_bitmasks": self._code_bitmasks,
+            "code_norms": self._code_norms,
+            "aux_vecs": self._aux_vecs,
+            "aux_weight": self._aux_weight,
+            "grid": grid_snapshot,
+        }
+        if self._np is not None:
+            np_mod = self._np
+            context["numpy"] = np_mod
+            context["code_packed"] = self._code_packed
+            context["grid_array"] = np_mod.array(grid_snapshot, dtype=np.int64)
+        return context
+        
+
+    def _parallel_pair_results(self, pairs: Sequence[Tuple[int, Tuple[int, int], int, Tuple[int, int]]], R: int) -> List[Tuple[int, Tuple[int, int], int, Tuple[int, int], float, float]]:
+        if not pairs:
+            return []
+        context = self._build_energy_context()
+        workers = self._effective_worker_count()
+        tasks = [(ia, yxa, ib, yxb, R) for ia, yxa, ib, yxb in pairs]
+        chunksize = self._energy_chunksize
+        if self._energy_backend == "process":
+            with ProcessPoolExecutor(max_workers=workers, initializer=_init_energy_worker, initargs=(context,)) as executor:
+                results = list(executor.map(_compute_pair_energy_task, tasks, chunksize=chunksize))
+        else:
+            _set_energy_context(context)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(_compute_pair_energy_task, tasks, chunksize=chunksize))
+            _set_energy_context(None)
+        return results
+
+    def _apply_pair_results(self,
+                            evaluated: Sequence[Tuple[int, Tuple[int, int], int, Tuple[int, int], float, float]],
+                            phase: str,
+                            epoch_index: int,
+                            on_swap) -> None:
+        for ia, yxa, ib, yxb, e_cur, e_swp in evaluated:
+            if self.idx2cell.get(ia) != yxa or self.idx2cell.get(ib) != yxb:
+                continue
+            if phase == "far":
+                if e_swp + 1e-9 < e_cur:
+                    self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                    self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                    self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                    if on_swap:
+                        on_swap(yxa, yxb, phase, epoch_index, self)
+            else:
+                if e_swp > e_cur + 1e-9:
+                    self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                    self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                    self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                    if on_swap:
+                        on_swap(yxa, yxb, phase, epoch_index, self)
+
     def fit(self,
             codes: List[Set[int]],
             *,
@@ -121,6 +308,8 @@ class Layout2D:
         self._code_norms = [math.sqrt(len(code)) if code else 0.0 for code in codes]
         self._aux_vecs = None
         self._aux_weight = 0.0
+        self._np = None
+        self._code_packed = None
         if aux_vectors is not None:
             if len(aux_vectors) != n:
                 raise ValueError("длина aux_vectors должна совпадать с числом кодов")
@@ -134,6 +323,22 @@ class Layout2D:
                     normed.append(tuple(v / norm for v in arr))
             self._aux_vecs = normed
             self._aux_weight = float(aux_weight)
+        if self._energy_backend == "thread" and codes:
+            try:
+                import numpy as np
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("для потокового бэкенда необходимо установить numpy") from exc
+            max_bit = max((max(code) for code in codes if code), default=-1)
+            words = (max_bit + 8) // 8 if max_bit >= 0 else 0
+            packed = np.zeros((n, words if words > 0 else 0), dtype=np.uint8)
+            if words > 0:
+                for idx, code in enumerate(codes):
+                    for bit in code:
+                        byte = bit // 8
+                        offset = bit % 8
+                        packed[idx, byte] |= 1 << offset
+            self._np = np
+            self._code_packed = packed
         self._prepare_neighbors([self.R_far, self.R_near])
         for i in range(n):
             yx = cells[i];
@@ -148,26 +353,30 @@ class Layout2D:
                 for i in range(0, len(occupied) - 1, 2):
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
-                sim_cache: Dict[Tuple[int, int], float] = {}
-                for ia, yxa, ib, yxb in pairs:
-                    e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
-                            self._local_energy(yxb, ib, R, sim_cache)
-                    override = ((yxa, ib), (yxb, ia))
-                    e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
-                            self._local_energy(yxb, ia, R, sim_cache, override=override)
+                if self._energy_backend == "sequential" or not pairs:
+                    sim_cache: Dict[Tuple[int, int], float] = {}
+                    for ia, yxa, ib, yxb in pairs:
+                        e_cur = self._local_energy(yxa, ia, R, sim_cache) + \
+                                self._local_energy(yxb, ib, R, sim_cache)
+                        override = ((yxa, ib), (yxb, ia))
+                        e_swp = self._local_energy(yxa, ib, R, sim_cache, override=override) + \
+                                self._local_energy(yxb, ia, R, sim_cache, override=override)
 
-                    if phase == "far":
-                        if e_swp + 1e-9 < e_cur:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if on_swap: on_swap(yxa, yxb, phase, ep, self)
-                    else:
-                        if e_swp > e_cur + 1e-9:
-                            self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
-                            self._cell_owner_grid[yxa[0]][yxa[1]] = ib
-                            self._cell_owner_grid[yxb[0]][yxb[1]] = ia
-                            if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                        if phase == "far":
+                            if e_swp + 1e-9 < e_cur:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                        else:
+                            if e_swp > e_cur + 1e-9:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                else:
+                    evaluated = self._parallel_pair_results(pairs, R)
+                    self._apply_pair_results(evaluated, phase, ep, on_swap)
 
                 if on_epoch: on_epoch(phase, ep, self)
 

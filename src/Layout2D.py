@@ -1,7 +1,7 @@
 import math
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
@@ -174,6 +174,23 @@ class Layout2D:
             self.idx2cell[i] = yx;
             self._cell_owner_grid[yx[0]][yx[1]] = i
 
+        executor: Optional[ThreadPoolExecutor] = None
+        if len(cells) > 1:
+            executor = ThreadPoolExecutor()
+
+        def evaluate_pair(ia, yxa, ib, yxb, radius, sim_cache, cache_lock):
+            override = ((yxa, ib), (yxb, ia))
+            e_cur = self._pair_energy(
+                yxa, ia, yxb, ib, radius,
+                sim_cache, cache_lock
+            )
+            e_swp = self._pair_energy(
+                yxa, ib, yxb, ia, radius,
+                sim_cache, cache_lock,
+                override=override
+            )
+            return ia, yxa, ib, yxb, e_cur, e_swp
+
         def pass_epoch(R: int, iters: int, phase: str):
             for ep in range(iters):
                 occupied = list(self.idx2cell.items());
@@ -183,20 +200,38 @@ class Layout2D:
                     (ia, yxa), (ib, yxb) = occupied[i], occupied[i + 1]
                     pairs.append((ia, yxa, ib, yxb))
                 sim_cache: Dict[Tuple[int, int], float] = {}
-                cache_lock = threading.Lock()
-                with ThreadPoolExecutor() as pool:
+                use_parallel = executor is not None and len(pairs) > 1
+                cache_lock = threading.Lock() if use_parallel else None
+                if not pairs:
+                    if on_epoch: on_epoch(phase, ep, self)
+                    continue
+                if not use_parallel:
                     for ia, yxa, ib, yxb in pairs:
-                        override = ((yxa, ib), (yxb, ia))
-                        future_cur = pool.submit(self._pair_energy,
-                                                 yxa, ia, yxb, ib, R,
-                                                 sim_cache, cache_lock)
-                        future_swp = pool.submit(self._pair_energy,
-                                                  yxa, ib, yxb, ia, R,
-                                                  sim_cache, cache_lock,
-                                                  override=override)
-                        e_cur = future_cur.result()
-                        e_swp = future_swp.result()
-
+                        _, _, _, _, e_cur, e_swp = evaluate_pair(
+                            ia, yxa, ib, yxb, R, sim_cache, cache_lock
+                        )
+                        if phase == "far":
+                            if e_swp + 1e-9 < e_cur:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                        else:
+                            if e_swp > e_cur + 1e-9:
+                                self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
+                                self._cell_owner_grid[yxa[0]][yxa[1]] = ib
+                                self._cell_owner_grid[yxb[0]][yxb[1]] = ia
+                                if on_swap: on_swap(yxa, yxb, phase, ep, self)
+                else:
+                    futures = [
+                        executor.submit(
+                            evaluate_pair, ia, yxa, ib, yxb, R, sim_cache, cache_lock
+                        )
+                        for ia, yxa, ib, yxb in pairs
+                    ]
+                    wait(futures)
+                    for fut in futures:
+                        ia, yxa, ib, yxb, e_cur, e_swp = fut.result()
                         if phase == "far":
                             if e_swp + 1e-9 < e_cur:
                                 self.idx2cell[ia], self.idx2cell[ib] = yxb, yxa
@@ -212,8 +247,12 @@ class Layout2D:
 
                 if on_epoch: on_epoch(phase, ep, self)
 
-        pass_epoch(self.R_far, self.E_far, phase="far")
-        pass_epoch(self.R_near, self.E_near, phase="near")
+        try:
+            pass_epoch(self.R_far, self.E_far, phase="far")
+            pass_epoch(self.R_near, self.E_near, phase="near")
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
         return self
 
     def grid_shape(self) -> Tuple[int, int]:

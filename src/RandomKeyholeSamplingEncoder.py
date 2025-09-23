@@ -31,7 +31,7 @@ class RandomKeyholeSamplingEncoder:
                  adaptive_decay: float = 0.5,
                  # --- символы для штрихкода (используются в print_keyhole_records) ---
                  barcode_on: str = "|",
-                 barcode_off: str = " ",
+                 barcode_off: str = ".",
                  ):
         self.H, self.W = img_hw
         self.B = int(bits)
@@ -161,11 +161,12 @@ class RandomKeyholeSamplingEncoder:
             else:
                 cosine_val = shared / math.sqrt(len_a * len_b)
 
-            print(f"∩ {prefix}: {overlap_pct:6.2f}% ({shared}/{union} бит); cos: {(cosine_val*100):6.2f}%")
+            # print(f"∩ {prefix}: {overlap_pct:6.2f}% ({shared}/{union} бит); cos: {(cosine_val*100):6.2f}%")
+            print(f"∩:{overlap_pct:6.2f}% cos:{(cosine_val*100):6.2f}%")
 
         for idx, (ang, code) in enumerate(recs):
             if prev_code is not None:
-                _print_overlap("с предыдущим", prev_code, code)
+                _print_overlap("", prev_code, code)
 
             deg = ang * 180.0 / np.pi
             if as_barcode:
@@ -173,7 +174,8 @@ class RandomKeyholeSamplingEncoder:
             else:
                 inds = sorted(int(b) for b in code)
                 s = f"indices={inds}"
-            print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
+            # print(f"{ang:.6f} rad ({deg:7.2f}°): {s}")
+            print(f"{deg:0.2f}°: {s}")
             if idx == total_recs - 1 and first_code is not None and total_recs > 1:
                 _print_overlap("с первым", code, first_code)
             prev_code = code

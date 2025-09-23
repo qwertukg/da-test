@@ -213,6 +213,8 @@ class RandomKeyholeSamplingEncoder:
             code = rec.code
             if prev_code is not None:
                 _print_overlap("с предыдущим", prev_code, code)
+                if rec.offset_id == 0:
+                    _print_overlap("с копией", prev_code, recs[idx + 1].code)
 
             deg = ang * 180.0 / np.pi
             if as_barcode:
@@ -220,9 +222,7 @@ class RandomKeyholeSamplingEncoder:
             else:
                 inds = sorted(int(b) for b in code)
                 s = f"indices={inds}"
-            print(
-                f"{ang:.6f} rad ({deg:7.2f}°) [скважина {rec.keyhole_idx}, копия {rec.offset_id}]: {s}"
-            )
+            print(f"{ang:.6f} rad ({deg:7.2f}°) [скважина {rec.keyhole_idx}, копия {rec.offset_id}]: {s}")
             if idx == total_recs - 1 and first_code is not None and total_recs > 1:
                 _print_overlap("с первым", code, first_code)
             prev_code = code

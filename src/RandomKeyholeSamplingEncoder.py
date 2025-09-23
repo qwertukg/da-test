@@ -189,6 +189,7 @@ class RandomKeyholeSamplingEncoder:
         print(f"Метка класса: {label_repr}")
 
         prev_code: Optional[Set[int]] = None
+        prev_rec: Optional[KeyholeRecord] = None
         first_code: Optional[Set[int]] = recs[0].code if recs else None
         total_recs = len(recs)
 
@@ -214,6 +215,14 @@ class RandomKeyholeSamplingEncoder:
             if prev_code is not None:
                 _print_overlap("с предыдущим", prev_code, code)
 
+            if (
+                prev_rec is not None
+                and rec.keyhole_idx == prev_rec.keyhole_idx
+                and prev_rec.offset_id == 0
+                and rec.offset_id == 1
+            ):
+                _print_overlap("копии 0 и 1", prev_rec.code, code)
+
             deg = ang * 180.0 / np.pi
             if as_barcode:
                 s = self._bits_to_barcode(code)
@@ -226,6 +235,7 @@ class RandomKeyholeSamplingEncoder:
             if idx == total_recs - 1 and first_code is not None and total_recs > 1:
                 _print_overlap("с первым", code, first_code)
             prev_code = code
+            prev_rec = rec
 
 
     # ==================== ВНУТРЕННЕЕ ====================

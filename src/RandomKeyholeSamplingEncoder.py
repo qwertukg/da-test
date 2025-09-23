@@ -227,6 +227,55 @@ class RandomKeyholeSamplingEncoder:
                 _print_overlap("с первым", code, first_code)
             prev_code = code
 
+        self.log_close_angle_cosines(max_angle_diff_deg=1.0)
+
+    def log_close_angle_cosines(self, max_angle_diff_deg: float = 1.0) -> None:
+        """Печатает косинусные близости для пар скважин с малой разницей по углу."""
+        if not self.keyhole_records:
+            print("Записей нет. Сначала вызовите encode().")
+            return
+
+        max_diff_rad = math.radians(float(max_angle_diff_deg))
+        recs = sorted(self.keyhole_records, key=lambda r: (r.angle, r.keyhole_idx, r.offset_id))
+
+        print(f"\nКосинусы пар скважин с Δугла ≤ {max_angle_diff_deg:.2f}°:")
+        found_pairs = False
+
+        for i, rec_a in enumerate(recs):
+            angle_a = rec_a.angle
+            code_a = rec_a.code
+            for rec_b in recs[i + 1:]:
+                angle_b = rec_b.angle
+                angle_diff = angle_b - angle_a
+                if angle_diff > max_diff_rad:
+                    break
+                angle_diff = abs(angle_diff)
+                if angle_diff <= max_diff_rad:
+                    code_b = rec_b.code
+                    shared = len(code_a & code_b)
+                    len_a = len(code_a)
+                    len_b = len(code_b)
+                    if len_a == 0 and len_b == 0:
+                        cosine = 1.0
+                    elif len_a == 0 or len_b == 0:
+                        cosine = 0.0
+                    else:
+                        cosine = shared / math.sqrt(len_a * len_b)
+
+                    deg_a = math.degrees(angle_a)
+                    deg_b = math.degrees(angle_b)
+                    diff_deg = math.degrees(angle_diff)
+                    print(
+                        "  · "
+                        f"(скважина {rec_a.keyhole_idx}, копия {rec_a.offset_id}, {deg_a:7.3f}°)"
+                        f" ↔ (скважина {rec_b.keyhole_idx}, копия {rec_b.offset_id}, {deg_b:7.3f}°): "
+                        f"cos = {cosine:7.4f}, Δугла = {diff_deg:6.3f}°"
+                    )
+                    found_pairs = True
+
+        if not found_pairs:
+            print("  Пар не найдено.")
+
 
     # ==================== ВНУТРЕННЕЕ ====================
 

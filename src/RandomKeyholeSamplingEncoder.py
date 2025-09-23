@@ -214,7 +214,7 @@ class RandomKeyholeSamplingEncoder:
             if prev_code is not None:
                 _print_overlap("с предыдущим", prev_code, code)
                 if rec.offset_id == 0:
-                    _print_overlap("с копией", prev_code, recs[idx + 1].code)
+                    _print_overlap("с копией", code, recs[idx + 1].code)
 
             deg = ang * 180.0 / np.pi
             if as_barcode:

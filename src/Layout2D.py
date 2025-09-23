@@ -2,6 +2,8 @@ import math
 import random
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
+
 
 class Layout2D:
 
@@ -20,6 +22,49 @@ class Layout2D:
         self._neighbor_cache: Dict[int, Dict[Tuple[int, int], Sequence[Tuple[Tuple[int, int], float]]]] = {}
         self._aux_vecs: Optional[List[Optional[Tuple[float, ...]]]] = None
         self._aux_weight: float = 0.0
+        self._packed_codes: Optional[np.ndarray] = None
+
+    def _build_packed_codes(self, codes: List[Set[int]]) -> None:
+        max_bit = -1
+        for code in codes:
+            if code:
+                code_max = max(code)
+                if code_max > max_bit:
+                    max_bit = code_max
+        if max_bit < 0:
+            self._packed_codes = None
+            return
+        n_codes = len(codes)
+        packed_bits = max_bit + 1
+        packed_bytes = (packed_bits + 7) // 8
+        packed = np.zeros((n_codes, packed_bytes), dtype=np.uint8)
+        for idx, code in enumerate(codes):
+            for bit in code:
+                byte_idx = bit // 8
+                bit_offset = bit % 8
+                packed[idx, byte_idx] |= 1 << bit_offset
+        self._packed_codes = packed
+
+    def _similarity_worker(self, ia: int, ib: int, np_mod=np) -> int:
+        mask_inter = self._code_bitmasks[ia] & self._code_bitmasks[ib]
+        if mask_inter == 0:
+            return 0
+        if self._packed_codes is None:
+            return mask_inter.bit_count()
+        if np_mod is None:
+            np_mod = np
+        packed_a = np_mod.asarray(self._packed_codes[ia])
+        packed_b = np_mod.asarray(self._packed_codes[ib])
+        packed_inter = np_mod.bitwise_and(packed_a, packed_b)
+        if hasattr(np_mod, "bit_count"):
+            inter = np_mod.bit_count(packed_inter).sum(dtype=np_mod.int64)
+            return int(inter)
+        try:
+            return mask_inter.bit_count()
+        except AttributeError:
+            unpacked = np_mod.unpackbits(packed_inter)
+            inter = unpacked.sum(dtype=np_mod.int64)
+            return int(inter)
 
     @staticmethod
     def _grid_shape(n: int) -> Tuple[int, int]:
@@ -53,7 +98,7 @@ class Layout2D:
         if denom == 0.0:
             sim = 0.0
         else:
-            inter = (self._code_bitmasks[a] & self._code_bitmasks[b]).bit_count()
+            inter = self._similarity_worker(a, b)
             sim = inter / denom
         if self._aux_vecs is not None and self._aux_weight > 0.0:
             va = self._aux_vecs[a]
@@ -110,6 +155,7 @@ class Layout2D:
             on_swap=None):
         self._codes = codes
         self._code_bitmasks = [self._code_to_bitmask(code) for code in codes]
+        self._build_packed_codes(codes)
         n = len(codes)
         H, W = self._grid_shape(n);
         self.shape = (H, W)
